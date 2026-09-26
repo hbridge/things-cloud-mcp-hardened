@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"time"
 
@@ -185,17 +184,16 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 	req.Header.Set("Things-Client-Info", base64.StdEncoding.EncodeToString(ciJSON))
 
 	if c.Debug {
-		bs, _ := httputil.DumpRequest(req, true)
-		log.Println("REQUEST:", string(bs))
+		log.Printf("Things Cloud request: method=%s host=%s", req.Method, req.URL.Hostname())
 	}
 
 	resp, err := c.client.Do(req)
 	if c.Debug {
 		if err == nil {
-			bs, _ := httputil.DumpResponse(resp, true)
-			log.Println("RESPONSE:", string(bs))
+			log.Printf("Things Cloud response: status=%d", resp.StatusCode)
+		} else {
+			log.Printf("Things Cloud request failed")
 		}
-		log.Println()
 	}
 	return resp, err
 }

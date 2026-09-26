@@ -26,7 +26,7 @@ func TestClient_RegisterAppInstance(t *testing.T) {
 	c := New(ts.URL, "test@test.com", "password")
 	err := c.RegisterAppInstance(AppInstanceRequest{
 		AppInstanceID: "hash1-com.culturedcode.ThingsMac-hash2",
-		HistoryKey:    "251943ab-63b5-45d1-8f9d-828a8d92fc15",
+		HistoryKey:    "test-history-key-2",
 		APNSToken:     "token123",
 		AppID:         "com.culturedcode.ThingsMac",
 		Dev:           false,
@@ -41,7 +41,7 @@ func TestClient_RegisterAppInstance(t *testing.T) {
 	if capturedPath != "/version/1/app-instance/hash1-com.culturedcode.ThingsMac-hash2" {
 		t.Errorf("unexpected path: %s", capturedPath)
 	}
-	if capturedBody["history-key"] != "251943ab-63b5-45d1-8f9d-828a8d92fc15" {
+	if capturedBody["history-key"] != "test-history-key-2" {
 		t.Error("expected history-key in body")
 	}
 }

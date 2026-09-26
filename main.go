@@ -138,6 +138,11 @@ func fnv32(s string) uint32 {
 	return h.Sum32()
 }
 
+func envEnabled(name string) bool {
+	enabled, err := strconv.ParseBool(strings.TrimSpace(os.Getenv(name)))
+	return err == nil && enabled
+}
+
 func parseProxyURLs(raw string) []*url.URL {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -146,18 +151,18 @@ func parseProxyURLs(raw string) []*url.URL {
 
 	parts := strings.Split(raw, ",")
 	var proxies []*url.URL
-	for _, part := range parts {
+	for i, part := range parts {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
 		u, err := url.Parse(part)
 		if err != nil {
-			log.Printf("Skipping invalid proxy URL %q: %v", part, err)
+			log.Printf("Skipping invalid proxy URL at position %d", i+1)
 			continue
 		}
 		if u.Scheme == "" {
-			log.Printf("Skipping proxy URL without scheme %q", part)
+			log.Printf("Skipping proxy URL without scheme at position %d", i+1)
 			continue
 		}
 		proxies = append(proxies, u)
@@ -974,9 +979,9 @@ func bestHistory(c *thingscloud.Client) (*thingscloud.History, error) {
 	}
 	full, err := c.History(own.ID)
 	if err != nil {
-		return nil, fmt.Errorf("fetch authoritative history %s: %w", own.ID, err)
+		return nil, fmt.Errorf("fetch authoritative history: %w", err)
 	}
-	log.Printf("Authoritative history: %s (serverIndex=%d, schema=%d)", full.ID, full.LatestServerIndex, full.LatestSchemaVersion)
+	log.Printf("Authoritative history selected (serverIndex=%d, schema=%d)", full.LatestServerIndex, full.LatestSchemaVersion)
 	return full, nil
 }
 
@@ -988,27 +993,27 @@ func NewThingsMCPForUser(email, password string, proxyURL *url.URL) (*ThingsMCP,
 	}
 
 	c := thingscloud.New(thingscloud.APIEndpoint, email, password, opts...)
-	if os.Getenv("THINGS_DEBUG") != "" {
+	if envEnabled("THINGS_DEBUG") {
 		c.Debug = true
 	}
 
-	log.Printf("Verifying Things Cloud credentials for %s...", email)
+	log.Printf("Verifying Things Cloud credentials")
 	verifyResponse, err := c.Verify()
 	if err != nil {
 		return nil, fmt.Errorf("login: %w", err)
 	}
-	log.Printf("Credentials verified for %s.", email)
+	log.Printf("Things Cloud credentials verified")
 
-	log.Printf("Fetching history for %s...", email)
+	log.Printf("Fetching authoritative history")
 	history, err := c.History(verifyResponse.HistoryKey)
 	if err != nil {
-		return nil, fmt.Errorf("get authoritative history %s: %w", verifyResponse.HistoryKey, err)
+		return nil, fmt.Errorf("get authoritative history: %w", err)
 	}
 	t := &ThingsMCP{client: c, history: history, proxyURL: proxyURL, credential: credentialDigest(email, password)}
 	if err := t.fullRebuild(); err != nil {
 		return nil, err
 	}
-	log.Printf("History ready for %s (id=%s, serverIndex=%d).", email, history.ID, history.LatestServerIndex)
+	log.Printf("History ready (serverIndex=%d)", history.LatestServerIndex)
 
 	return t, nil
 }
@@ -1036,12 +1041,13 @@ type UserInfo struct {
 }
 
 type UserManager struct {
-	users     map[string]*ThingsMCP // keyed by email
-	proxyURLs []*url.URL
-	oauth     *OAuthServer // set after OAuthServer is created
-	diagStore *DiagStore   // set after OAuthServer is created
-	newUser   func(email, password string, proxyURL *url.URL) (*ThingsMCP, error)
-	mu        sync.RWMutex
+	users        map[string]*ThingsMCP // keyed by email
+	proxyURLs    []*url.URL
+	allowedEmail string
+	oauth        *OAuthServer // set after OAuthServer is created
+	diagStore    *DiagStore   // non-nil only when diagnostic sharing is enabled
+	newUser      func(email, password string, proxyURL *url.URL) (*ThingsMCP, error)
+	mu           sync.RWMutex
 }
 
 func NewUserManager() *UserManager {
@@ -1059,8 +1065,15 @@ func sameCredential(a, b [sha256.Size]byte) bool {
 	return subtle.ConstantTimeCompare(a[:], b[:]) == 1
 }
 
+func (um *UserManager) emailAllowed(email string) bool {
+	return um.allowedEmail == "" || strings.EqualFold(strings.TrimSpace(email), um.allowedEmail)
+}
+
 func (um *UserManager) GetOrCreateUser(email, password string) (*ThingsMCP, error) {
 	email = strings.TrimSpace(email)
+	if !um.emailAllowed(email) {
+		return nil, fmt.Errorf("account is not allowed on this server")
+	}
 	key := strings.ToLower(email)
 	digest := credentialDigest(key, password)
 	um.mu.RLock()
@@ -1077,7 +1090,7 @@ func (um *UserManager) GetOrCreateUser(email, password string) (*ThingsMCP, erro
 	// without allowing an arbitrary password to inherit an authenticated cache.
 	proxy := um.proxyForEmail(email)
 	if proxy != nil {
-		log.Printf("User %s -> proxy %s", email, proxy.Host)
+		log.Printf("Using configured proxy for Things Cloud request")
 	}
 	t, err := um.newUser(email, password, proxy)
 	if err != nil {
@@ -1155,11 +1168,11 @@ func getUserFromContext(ctx context.Context, um *UserManager) (*ThingsMCP, error
 	// Bearer token path — resolve JWT via OAuthServer
 	if info.Token != "" {
 		if um.oauth == nil {
-			return nil, fmt.Errorf("Bearer token authentication not configured")
+			return nil, fmt.Errorf("bearer token authentication not configured")
 		}
 		email, password, err := um.oauth.ResolveBearer(info.Token)
 		if err != nil {
-			return nil, fmt.Errorf("Bearer auth failed: %w", err)
+			return nil, fmt.Errorf("bearer auth failed: %w", err)
 		}
 		return um.GetOrCreateUser(email, password)
 	}
@@ -1944,11 +1957,11 @@ func extractCredentials(ctx context.Context, um *UserManager) (string, string, e
 	}
 	if info.Token != "" {
 		if um.oauth == nil {
-			return "", "", fmt.Errorf("Bearer token authentication not configured")
+			return "", "", fmt.Errorf("bearer token authentication not configured")
 		}
 		email, password, err := um.oauth.ResolveBearer(info.Token)
 		if err != nil {
-			return "", "", fmt.Errorf("Bearer auth failed: %w", err)
+			return "", "", fmt.Errorf("bearer auth failed: %w", err)
 		}
 		return email, password, nil
 	}
@@ -2006,11 +2019,10 @@ func (t *ThingsMCP) handleDiagnose(email, password string) *diagReport {
 	step1.Status = "pass"
 	step1.Details = map[string]any{
 		"accountStatus": string(verifyResp.Status),
-		"historyKey":    verifyResp.HistoryKey,
 		"email":         maskEmail(verifyResp.Email),
 	}
 	step1.Log = append(step1.Log, fmt.Sprintf("Account status: %s", verifyResp.Status))
-	step1.Log = append(step1.Log, fmt.Sprintf("History key from /verify: %s", verifyResp.HistoryKey))
+	step1.Log = append(step1.Log, "Authoritative history key received")
 	report.Steps = append(report.Steps, step1)
 
 	// Step 2: resolve the authoritative history, then enumerate other keys for
@@ -2042,7 +2054,6 @@ func (t *ThingsMCP) handleDiagnose(email, password string) *diagReport {
 
 	// Enumerate all histories for the diagnostic report.
 	type historyInfo struct {
-		ID                string `json:"id"`
 		LatestServerIndex int    `json:"latestServerIndex"`
 		IsOwnHistory      bool   `json:"isOwnHistory"`
 		Selected          bool   `json:"selected"`
@@ -2061,14 +2072,13 @@ func (t *ThingsMCP) handleDiagnose(email, password string) *diagReport {
 		allWarnings = append(allWarnings, fmt.Sprintf("Step 2: %s", w))
 	}
 	ownKeyFound := false
-	for _, h := range histories {
+	for i, h := range histories {
 		full, ferr := client.History(h.ID)
 		if ferr != nil {
-			step2.Log = append(step2.Log, fmt.Sprintf("History %s: failed to fetch metadata: %v", h.ID, ferr))
+			step2.Log = append(step2.Log, fmt.Sprintf("History %d: failed to fetch metadata: %v", i+1, ferr))
 			continue
 		}
 		hi := historyInfo{
-			ID:                full.ID,
 			LatestServerIndex: full.LatestServerIndex,
 			IsOwnHistory:      full.ID == ownHistoryID,
 			Selected:          full.ID == history.ID,
@@ -2104,11 +2114,11 @@ func (t *ThingsMCP) handleDiagnose(email, password string) *diagReport {
 					hi.NewestItemDate = newestDate.Format("2006-01-02")
 				}
 			} else {
-				step2.Log = append(step2.Log, fmt.Sprintf("History %s: failed to peek items: %v", full.ID, ierr))
+				step2.Log = append(step2.Log, fmt.Sprintf("History %d: failed to peek items: %v", i+1, ierr))
 			}
 		}
 		allHistories = append(allHistories, hi)
-		logLine := fmt.Sprintf("History %s: serverIndex=%d, isOwnHistory=%v, selected=%v", full.ID, hi.LatestServerIndex, hi.IsOwnHistory, hi.Selected)
+		logLine := fmt.Sprintf("History %d: serverIndex=%d, isOwnHistory=%v, selected=%v", i+1, hi.LatestServerIndex, hi.IsOwnHistory, hi.Selected)
 		if hi.NewestItemDate != "" {
 			logLine += fmt.Sprintf(", newestItemDate=%s", hi.NewestItemDate)
 		}
@@ -2117,7 +2127,7 @@ func (t *ThingsMCP) handleDiagnose(email, password string) *diagReport {
 
 	// Check if account history key appears in own-history-keys list
 	if len(histories) > 0 && !ownKeyFound {
-		w := fmt.Sprintf("Account history key (%s) not found in own-history-keys list", ownHistoryID)
+		w := "Account history key not found in own-history-keys list"
 		step2.Log = append(step2.Log, fmt.Sprintf("Warning: %s", w))
 		allWarnings = append(allWarnings, fmt.Sprintf("Step 2: %s", w))
 	}
@@ -2140,17 +2150,15 @@ func (t *ThingsMCP) handleDiagnose(email, password string) *diagReport {
 	step2.Status = "pass"
 	step2.Details = map[string]any{
 		"historyCount":            len(histories),
-		"selectedHistory":         history.ID,
 		"selectedServerIndexMeta": selectedServerIndex,
-		"ownHistoryKey":           ownHistoryID,
 		"selectedIsSameAsOwn":     history.ID == ownHistoryID,
 		"allHistories":            allHistories,
 	}
 	if history.ID != ownHistoryID && len(histories) > 1 {
-		step2.Log = append(step2.Log, fmt.Sprintf("WARNING: Selected history %s differs from OwnHistory %s — account may have multiple sync streams", history.ID, ownHistoryID))
+		step2.Log = append(step2.Log, "WARNING: Selected history differs from OwnHistory — account may have multiple sync streams")
 		allWarnings = append(allWarnings, "Selected history differs from OwnHistory — multi-device account detected")
 	}
-	step2.Log = append(step2.Log, fmt.Sprintf("Selected history: %s (serverIndex=%d)", history.ID, history.LatestServerIndex))
+	step2.Log = append(step2.Log, fmt.Sprintf("Selected authoritative history (serverIndex=%d)", history.LatestServerIndex))
 	report.Steps = append(report.Steps, step2)
 
 	// Step 3: sync_history
@@ -2286,7 +2294,6 @@ func (t *ThingsMCP) diagnoseSteps4to7(history *thingscloud.History, report *diag
 			Kind         string `json:"kind"`
 			Action       int    `json:"action"`
 			CreationDate string `json:"creationDate,omitempty"`
-			Title        string `json:"title,omitempty"`
 		}
 		var tail []tailItem
 		tailStart := len(allItems) - 5
@@ -2302,13 +2309,6 @@ func (t *ThingsMCP) diagnoseSteps4to7(history *thingscloud.History, report *diag
 						cd := payload.CreationDate.Time()
 						ti.CreationDate = cd.Format("2006-01-02T15:04:05Z")
 					}
-					if payload.Title != nil {
-						t := *payload.Title
-						if len(t) > 30 {
-							t = t[:30] + "..."
-						}
-						ti.Title = t
-					}
 				}
 			}
 			tail = append(tail, ti)
@@ -2318,9 +2318,6 @@ func (t *ThingsMCP) diagnoseSteps4to7(history *thingscloud.History, report *diag
 			desc := ti.Kind
 			if ti.CreationDate != "" {
 				desc += " created=" + ti.CreationDate
-			}
-			if ti.Title != "" {
-				desc += " title=" + ti.Title
 			}
 			step4.Log = append(step4.Log, fmt.Sprintf("Tail item: %s (action=%d)", desc, ti.Action))
 		}
@@ -4489,8 +4486,33 @@ func defineTools(um *UserManager) []server.ServerTool {
 // ---------------------------------------------------------------------------
 
 func serveDiagReportPage(w http.ResponseWriter, reportJSON string) {
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Write([]byte(reportJSON))
+}
+
+func hardenedHTTPHandler(next http.Handler, expectedHost string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if !strings.EqualFold(r.Host, expectedHost) {
+			http.Error(w, "invalid host", http.StatusMisdirectedRequest)
+			return
+		}
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		if strings.HasPrefix(r.URL.Path, "/authorize") || r.URL.Path == "/token" || r.URL.Path == "/register" {
+			w.Header().Set("Cache-Control", "no-store")
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -4500,11 +4522,23 @@ func serveDiagReportPage(w http.ResponseWriter, reportJSON string) {
 func main() {
 	log.SetFlags(log.Ltime | log.Lmsgprefix)
 	log.SetPrefix("[things-mcp] ")
+	publicBaseURL, err := validatePublicBaseURL(os.Getenv("PUBLIC_BASE_URL"))
+	if err != nil {
+		log.Fatalf("Invalid PUBLIC_BASE_URL: %v", err)
+	}
+	publicURL, err := url.Parse(publicBaseURL)
+	if err != nil {
+		log.Fatalf("Invalid PUBLIC_BASE_URL: %v", err)
+	}
 	proxyURLs := parseProxyURLs(os.Getenv("PROXY_URLS"))
 	log.Printf("Loaded %d proxy URLs", len(proxyURLs))
 
 	um := NewUserManager()
 	um.proxyURLs = proxyURLs
+	um.allowedEmail = strings.ToLower(strings.TrimSpace(os.Getenv("ALLOWED_THINGS_EMAIL")))
+	if um.allowedEmail == "" {
+		log.Fatalf("ALLOWED_THINGS_EMAIL is required for personal deployments")
+	}
 
 	// Initialize OAuth server with persistent state
 	dataDir := os.Getenv("DATA_DIR")
@@ -4513,12 +4547,15 @@ func main() {
 	}
 	oauth := NewOAuthServer(um, dataDir)
 	um.oauth = oauth
-	um.diagStore = &DiagStore{db: oauth.db}
+	if envEnabled("ENABLE_DIAGNOSTIC_SHARING") {
+		um.diagStore = &DiagStore{db: oauth.db}
+		log.Printf("Diagnostic sharing enabled")
+	}
 
 	hooks := &server.Hooks{}
 	hooks.AddAfterInitialize(func(ctx context.Context, id any, message *mcp.InitializeRequest, result *mcp.InitializeResult) {
 		result.ServerInfo.Icons = []mcp.Icon{
-			{Src: "https://thingscloudmcp.com/favicon.svg", MIMEType: "image/svg+xml"},
+			{Src: publicBaseURL + "/favicon.svg", MIMEType: "image/svg+xml"},
 		}
 	})
 
@@ -4568,7 +4605,7 @@ func main() {
 	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
-			base := getBaseURL(r)
+			base := publicBaseURL
 			w.Header().Set("WWW-Authenticate", `Bearer resource_metadata="`+base+`/.well-known/oauth-protected-resource"`)
 			w.WriteHeader(http.StatusUnauthorized)
 			return
@@ -4592,42 +4629,45 @@ func main() {
 	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Cache-Control", "public, max-age=86400")
-		w.Write([]byte("User-agent: *\nAllow: /\n\nSitemap: https://thingscloudmcp.com/sitemap.xml\n"))
+		w.Write([]byte("User-agent: *\nAllow: /\n\nSitemap: " + publicBaseURL + "/sitemap.xml\n"))
 	})
 	mux.HandleFunc("/sitemap.xml", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 		w.Header().Set("Cache-Control", "public, max-age=86400")
 		w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <url><loc>https://thingscloudmcp.com/</loc><priority>1.0</priority></url>
-  <url><loc>https://thingscloudmcp.com/docs</loc><priority>0.8</priority></url>
-  <url><loc>https://thingscloudmcp.com/how-it-works</loc><priority>0.8</priority></url>
-</urlset>`))
+	  <url><loc>` + publicBaseURL + `</loc><priority>1.0</priority></url>
+	  <url><loc>` + publicBaseURL + `/docs</loc><priority>0.8</priority></url>
+	  <url><loc>` + publicBaseURL + `/how-it-works</loc><priority>0.8</priority></url>
+	</urlset>`))
 	})
-	mux.HandleFunc("/d/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		token := strings.TrimPrefix(r.URL.Path, "/d/")
-		if _, err := uuid.Parse(token); err != nil {
-			http.NotFound(w, r)
-			return
-		}
-		reportJSON, _, _, err := um.diagStore.Load(token)
-		if err != nil {
-			http.NotFound(w, r)
-			return
-		}
-		serveDiagReportPage(w, reportJSON)
-	})
+	if um.diagStore != nil {
+		mux.HandleFunc("/d/", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			token := strings.TrimPrefix(r.URL.Path, "/d/")
+			if _, err := uuid.Parse(token); err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			reportJSON, _, _, err := um.diagStore.Load(token)
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			serveDiagReportPage(w, reportJSON)
+		})
+	}
 
 	httpServer := &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           hardenedHTTPHandler(mux, publicURL.Host),
 		ReadHeaderTimeout: 30 * time.Second,
 		WriteTimeout:      5 * time.Minute,
 		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}
 
 	log.Printf("Things Cloud MCP server listening on %s", addr)

@@ -17,7 +17,7 @@ func TestHistory_Items(t *testing.T) {
 		c := New(fmt.Sprintf("http://%s", server.Listener.Addr().String()), "martin@example.com", "")
 		h := &History{
 			Client: c,
-			ID:     "33333abb-bfe4-4b03-a5c9-106d42220c72",
+			ID:     "test-history-key-1",
 		}
 		items, _, err := h.Items(ItemsOptions{})
 		if err != nil {

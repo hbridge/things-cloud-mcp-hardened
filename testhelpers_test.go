@@ -391,9 +391,6 @@ func assertNotError(t *testing.T, r *mcp.CallToolResult) {
 	}
 }
 
-// ptr returns a pointer to the given value.
-func ptr[T any](v T) *T { return &v }
-
 // mustTime parses a date string or panics.
 func mustTime(s string) time.Time {
 	t, err := time.Parse("2006-01-02", s)

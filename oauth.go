@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,6 +29,7 @@ import (
 
 type OAuthServer struct {
 	um            *UserManager
+	publicBaseURL string
 	jwtSecret     []byte
 	credentialKey []byte
 	clients       map[string]*OAuthClient  // client_id -> client
@@ -56,7 +58,6 @@ type AuthCode struct {
 	Password      string
 	CodeChallenge string
 	ExpiresAt     time.Time
-	Used          bool
 }
 
 type RefreshToken struct {
@@ -110,8 +111,17 @@ func NewOAuthServer(um *UserManager, dataDir string) *OAuthServer {
 		log.Fatalf("Failed to secure OAuth database: %v", err)
 	}
 
+	publicBaseURL := ""
+	if raw := os.Getenv("PUBLIC_BASE_URL"); strings.TrimSpace(raw) != "" {
+		var err error
+		publicBaseURL, err = validatePublicBaseURL(raw)
+		if err != nil {
+			log.Fatalf("Invalid PUBLIC_BASE_URL: %v", err)
+		}
+	}
 	o := &OAuthServer{
 		um:            um,
+		publicBaseURL: publicBaseURL,
 		db:            db,
 		clients:       make(map[string]*OAuthClient),
 		authCodes:     make(map[string]*AuthCode),
@@ -126,22 +136,31 @@ func NewOAuthServer(um *UserManager, dataDir string) *OAuthServer {
 
 	// Load JWT secret: env > DB > generate
 	if envSecret := os.Getenv("JWT_SECRET"); envSecret != "" {
+		if len(envSecret) < 32 {
+			log.Fatalf("JWT_SECRET must contain at least 32 characters")
+		}
 		o.jwtSecret = []byte(envSecret)
 	} else {
 		var dbSecret string
 		if err := db.QueryRow(`SELECT value FROM kv WHERE key='jwt_secret'`).Scan(&dbSecret); err == nil {
 			if secret, err := base64.RawURLEncoding.DecodeString(dbSecret); err == nil {
-				o.jwtSecret = secret
+				if len(secret) >= 32 {
+					o.jwtSecret = secret
+				}
 			}
 		}
 	}
 	if len(o.jwtSecret) == 0 {
 		o.jwtSecret = make([]byte, 32)
-		rand.Read(o.jwtSecret)
+		if _, err := rand.Read(o.jwtSecret); err != nil {
+			log.Fatalf("Failed to generate JWT secret: %v", err)
+		}
 		log.Printf("Generated new JWT secret (will be persisted)")
 	}
-	db.Exec(`INSERT OR REPLACE INTO kv (key, value) VALUES ('jwt_secret', ?)`,
-		base64.RawURLEncoding.EncodeToString(o.jwtSecret))
+	if _, err := db.Exec(`INSERT OR REPLACE INTO kv (key, value) VALUES ('jwt_secret', ?)`,
+		base64.RawURLEncoding.EncodeToString(o.jwtSecret)); err != nil {
+		log.Fatalf("Failed to persist JWT secret: %v", err)
+	}
 
 	// Load clients
 	rows, err := db.Query(`SELECT client_id, client_secret, client_name, redirect_uris, grant_types, response_types, created_at FROM clients`)
@@ -179,8 +198,7 @@ func NewOAuthServer(um *UserManager, dataDir string) *OAuthServer {
 			rt.Token = tokenKey
 			password, legacy, err := o.decryptPassword(storedPassword)
 			if err != nil {
-				log.Printf("Skipping refresh token with unreadable encrypted credential")
-				continue
+				log.Fatalf("Failed to decrypt persisted refresh credential; verify CREDENTIALS_SECRET or credentials.key")
 			}
 			rt.Password = password
 			encryptedPassword := storedPassword
@@ -221,8 +239,7 @@ func NewOAuthServer(um *UserManager, dataDir string) *OAuthServer {
 			}
 			password, legacy, err := o.decryptPassword(storedPassword)
 			if err != nil {
-				log.Printf("Skipping user with unreadable encrypted credential")
-				continue
+				log.Fatalf("Failed to decrypt persisted credential; verify CREDENTIALS_SECRET or credentials.key")
 			}
 			o.credentials[email] = password
 			if legacy {
@@ -254,6 +271,9 @@ var credentialAAD = []byte("things-cloud-mcp/oauth-password/v1")
 
 func loadOrCreateCredentialKey(db *sql.DB, dataDir string) ([]byte, error) {
 	if envSecret := os.Getenv("CREDENTIALS_SECRET"); envSecret != "" {
+		if len(envSecret) < 32 {
+			return nil, fmt.Errorf("CREDENTIALS_SECRET must contain at least 32 characters")
+		}
 		digest := sha256.Sum256([]byte(envSecret))
 		return digest[:], nil
 	}
@@ -398,23 +418,66 @@ func (o *OAuthServer) rotateRefreshToken(oldToken string, next *RefreshToken) er
 // Helpers
 // ---------------------------------------------------------------------------
 
-func randomString(n int) string {
+func randomString(n int) (string, error) {
 	b := make([]byte, n)
-	rand.Read(b)
-	return base64.RawURLEncoding.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate secure random value: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 func getBaseURL(r *http.Request) string {
-	scheme := r.Header.Get("X-Forwarded-Proto")
-	if scheme == "" {
-		host := r.Host
-		if strings.HasPrefix(host, "localhost") || strings.HasPrefix(host, "127.0.0.1") || strings.HasPrefix(host, "[::1]") {
-			scheme = "http"
-		} else {
-			scheme = "https"
-		}
+	if configured := strings.TrimSpace(os.Getenv("PUBLIC_BASE_URL")); configured != "" {
+		return strings.TrimRight(configured, "/")
 	}
-	return scheme + "://" + r.Host
+	return ""
+}
+
+func requestBaseURL(w http.ResponseWriter, r *http.Request) (string, bool) {
+	base := getBaseURL(r)
+	if base == "" {
+		http.Error(w, "server base URL is not configured", http.StatusInternalServerError)
+		return "", false
+	}
+	return base, true
+}
+
+func validatePublicBaseURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("PUBLIC_BASE_URL is required")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("PUBLIC_BASE_URL must be an absolute URL without credentials, query, or fragment")
+	}
+	if u.Scheme != "https" && !(u.Scheme == "http" && isLoopbackHostname(u.Hostname())) {
+		return "", fmt.Errorf("PUBLIC_BASE_URL must use https except for loopback development")
+	}
+	if u.Path != "" && u.Path != "/" {
+		return "", fmt.Errorf("PUBLIC_BASE_URL must not contain a path")
+	}
+	return strings.TrimRight(u.String(), "/"), nil
+}
+
+func isLoopbackHostname(host string) bool {
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func validateRedirectURI(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || !u.IsAbs() || u.Host == "" || u.User != nil || u.Fragment != "" {
+		return fmt.Errorf("redirect URI must be absolute and must not contain credentials or a fragment")
+	}
+	if u.Scheme != "https" && !(u.Scheme == "http" && isLoopbackHostname(u.Hostname())) {
+		return fmt.Errorf("redirect URI must use https except for loopback clients")
+	}
+	return nil
+}
+
+func validateCodeChallenge(challenge string) bool {
+	decoded, err := base64.RawURLEncoding.DecodeString(challenge)
+	return err == nil && len(decoded) == sha256.Size
 }
 
 func verifyPKCE(codeVerifier, codeChallenge string) bool {
@@ -483,11 +546,13 @@ func (o *OAuthServer) parseJWT(tokenStr string) (map[string]any, error) {
 		return nil, fmt.Errorf("invalid JWT payload: %w", err)
 	}
 
-	// Check expiration
-	if exp, ok := claims["exp"].(float64); ok {
-		if time.Now().Unix() > int64(exp) {
-			return nil, fmt.Errorf("JWT expired")
-		}
+	// Access tokens must always have a valid expiry.
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return nil, fmt.Errorf("JWT is missing expiration")
+	}
+	if time.Now().Unix() > int64(exp) {
+		return nil, fmt.Errorf("JWT expired")
 	}
 
 	return claims, nil
@@ -503,6 +568,15 @@ func (o *OAuthServer) ResolveBearer(token string) (string, string, error) {
 	email, ok := claims["sub"].(string)
 	if !ok || email == "" {
 		return "", "", fmt.Errorf("invalid token: missing subject")
+	}
+	if o.publicBaseURL != "" {
+		issuer, ok := claims["iss"].(string)
+		if !ok || issuer != o.publicBaseURL {
+			return "", "", fmt.Errorf("invalid token: issuer mismatch")
+		}
+	}
+	if scope, ok := claims["scope"].(string); !ok || !strings.Contains(" "+scope+" ", " things:manage ") {
+		return "", "", fmt.Errorf("invalid token: required scope is missing")
 	}
 
 	o.mu.RLock()
@@ -524,7 +598,10 @@ func (o *OAuthServer) handleProtectedResourceMetadata(w http.ResponseWriter, r *
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	base := getBaseURL(r)
+	base, ok := requestBaseURL(w, r)
+	if !ok {
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"resource":                 base,
 		"authorization_servers":    []string{base},
@@ -538,7 +615,10 @@ func (o *OAuthServer) handleAuthServerMetadata(w http.ResponseWriter, r *http.Re
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	base := getBaseURL(r)
+	base, ok := requestBaseURL(w, r)
+	if !ok {
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"issuer":                                base,
 		"authorization_endpoint":                base + "/authorize",
@@ -547,7 +627,7 @@ func (o *OAuthServer) handleAuthServerMetadata(w http.ResponseWriter, r *http.Re
 		"scopes_supported":                      []string{"things:manage"},
 		"response_types_supported":              []string{"code"},
 		"grant_types_supported":                 []string{"authorization_code", "refresh_token"},
-		"token_endpoint_auth_methods_supported": []string{"none", "client_secret_basic"},
+		"token_endpoint_auth_methods_supported": []string{"none"},
 		"code_challenge_methods_supported":      []string{"S256"},
 	})
 }
@@ -562,6 +642,7 @@ func (o *OAuthServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	var req struct {
 		ClientName    string   `json:"client_name"`
 		RedirectURIs  []string `json:"redirect_uris"`
@@ -573,13 +654,23 @@ func (o *OAuthServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(req.RedirectURIs) == 0 {
+	if len(req.RedirectURIs) == 0 || len(req.RedirectURIs) > 10 {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", "redirect_uris is required")
 		return
+	}
+	for _, redirectURI := range req.RedirectURIs {
+		if err := validateRedirectURI(redirectURI); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid_redirect_uri", err.Error())
+			return
+		}
 	}
 
 	if req.ClientName == "" {
 		req.ClientName = "Unknown Client"
+	}
+	if len(req.ClientName) > 128 {
+		writeJSONError(w, http.StatusBadRequest, "invalid_client_metadata", "client_name is too long")
+		return
 	}
 	if len(req.GrantTypes) == 0 {
 		req.GrantTypes = []string{"authorization_code"}
@@ -587,8 +678,24 @@ func (o *OAuthServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if len(req.ResponseTypes) == 0 {
 		req.ResponseTypes = []string{"code"}
 	}
+	for _, grantType := range req.GrantTypes {
+		if grantType != "authorization_code" && grantType != "refresh_token" {
+			writeJSONError(w, http.StatusBadRequest, "invalid_client_metadata", "unsupported grant type")
+			return
+		}
+	}
+	for _, responseType := range req.ResponseTypes {
+		if responseType != "code" {
+			writeJSONError(w, http.StatusBadRequest, "invalid_client_metadata", "unsupported response type")
+			return
+		}
+	}
 
-	clientID := randomString(24)
+	clientID, err := randomString(24)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "server_error", "failed to create client identifier")
+		return
+	}
 
 	client := &OAuthClient{
 		ClientID:      clientID,
@@ -599,19 +706,22 @@ func (o *OAuthServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:     time.Now(),
 	}
 
+	redirectURIsJSON, _ := json.Marshal(client.RedirectURIs)
+	grantTypesJSON, _ := json.Marshal(client.GrantTypes)
+	responseTypesJSON, _ := json.Marshal(client.ResponseTypes)
+	if _, err := o.db.Exec(`INSERT INTO clients VALUES(?,?,?,?,?,?,?)`,
+		clientID, client.ClientSecret, client.ClientName,
+		string(redirectURIsJSON), string(grantTypesJSON), string(responseTypesJSON),
+		client.CreatedAt.Format(time.RFC3339)); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "server_error", "failed to register client")
+		return
+	}
+
 	o.mu.Lock()
 	o.clients[clientID] = client
 	o.mu.Unlock()
 
-	redirectURIsJSON, _ := json.Marshal(client.RedirectURIs)
-	grantTypesJSON, _ := json.Marshal(client.GrantTypes)
-	responseTypesJSON, _ := json.Marshal(client.ResponseTypes)
-	o.db.Exec(`INSERT INTO clients VALUES(?,?,?,?,?,?,?)`,
-		clientID, client.ClientSecret, client.ClientName,
-		string(redirectURIsJSON), string(grantTypesJSON), string(responseTypesJSON),
-		client.CreatedAt.Format(time.RFC3339))
-
-	log.Printf("OAuth: registered client %q (id=%s)", req.ClientName, clientID)
+	log.Printf("OAuth: registered client %q", req.ClientName)
 
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"client_id":      clientID,
@@ -627,6 +737,7 @@ func (o *OAuthServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 func (o *OAuthServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {
+	o.pruneExpiredAuthCodes(time.Now())
 	switch r.Method {
 	case http.MethodGet:
 		o.handleAuthorizeGet(w, r)
@@ -637,47 +748,48 @@ func (o *OAuthServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (o *OAuthServer) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	clientID := q.Get("client_id")
-	responseType := q.Get("response_type")
-	redirectURI := q.Get("redirect_uri")
-	state := q.Get("state")
-	codeChallenge := q.Get("code_challenge")
-	codeChallengeMethod := q.Get("code_challenge_method")
+func (o *OAuthServer) pruneExpiredAuthCodes(now time.Time) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for code, authCode := range o.authCodes {
+		if now.After(authCode.ExpiresAt) {
+			delete(o.authCodes, code)
+		}
+	}
+}
 
-	// Validate required params
-	if responseType != "code" {
-		o.renderLoginPage(w, "", "Unsupported response_type. Must be 'code'.", q.Encode())
-		return
+func (o *OAuthServer) validateAuthorizationRequest(q url.Values) (*OAuthClient, error) {
+	if q.Get("response_type") != "code" {
+		return nil, fmt.Errorf("unsupported response_type")
 	}
-	if clientID == "" || redirectURI == "" || state == "" {
-		o.renderLoginPage(w, "", "Missing required parameters: client_id, redirect_uri, state.", q.Encode())
-		return
+	clientID := q.Get("client_id")
+	redirectURI := q.Get("redirect_uri")
+	if clientID == "" || redirectURI == "" || q.Get("state") == "" {
+		return nil, fmt.Errorf("missing required authorization parameters")
 	}
-	if codeChallenge == "" || codeChallengeMethod != "S256" {
-		o.renderLoginPage(w, "", "PKCE required: code_challenge and code_challenge_method=S256.", q.Encode())
-		return
+	if q.Get("code_challenge_method") != "S256" || !validateCodeChallenge(q.Get("code_challenge")) {
+		return nil, fmt.Errorf("valid S256 PKCE challenge required")
 	}
 
 	o.mu.RLock()
 	client, ok := o.clients[clientID]
 	o.mu.RUnlock()
 	if !ok {
-		o.renderLoginPage(w, "", "Unknown client_id.", q.Encode())
-		return
+		return nil, fmt.Errorf("unknown client_id")
 	}
-
-	// Validate redirect URI
-	validURI := false
-	for _, uri := range client.RedirectURIs {
-		if uri == redirectURI {
-			validURI = true
-			break
+	for _, allowed := range client.RedirectURIs {
+		if allowed == redirectURI {
+			return client, nil
 		}
 	}
-	if !validURI {
-		o.renderLoginPage(w, "", "Invalid redirect_uri.", q.Encode())
+	return nil, fmt.Errorf("invalid redirect_uri")
+}
+
+func (o *OAuthServer) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	client, err := o.validateAuthorizationRequest(q)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 
@@ -685,6 +797,7 @@ func (o *OAuthServer) handleAuthorizeGet(w http.ResponseWriter, r *http.Request)
 }
 
 func (o *OAuthServer) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
@@ -696,19 +809,21 @@ func (o *OAuthServer) handleAuthorizePost(w http.ResponseWriter, r *http.Request
 	redirectURI := q.Get("redirect_uri")
 	state := q.Get("state")
 	codeChallenge := q.Get("code_challenge")
+	client, err := o.validateAuthorizationRequest(q)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
 
 	email := r.PostFormValue("email")
 	password := r.PostFormValue("password")
 
 	if email == "" || password == "" {
-		o.mu.RLock()
-		client := o.clients[clientID]
-		o.mu.RUnlock()
-		clientName := ""
-		if client != nil {
-			clientName = client.ClientName
-		}
-		o.renderLoginPage(w, clientName, "Email and password are required.", q.Encode())
+		o.renderLoginPage(w, client.ClientName, "Email and password are required.", q.Encode())
+		return
+	}
+	if !o.um.emailAllowed(email) {
+		o.renderLoginPage(w, client.ClientName, "This account is not allowed on this server.", q.Encode())
 		return
 	}
 
@@ -719,19 +834,16 @@ func (o *OAuthServer) handleAuthorizePost(w http.ResponseWriter, r *http.Request
 	}
 	c := thingscloud.New(thingscloud.APIEndpoint, email, password, opts...)
 	if _, err := c.Verify(); err != nil {
-		o.mu.RLock()
-		client := o.clients[clientID]
-		o.mu.RUnlock()
-		clientName := ""
-		if client != nil {
-			clientName = client.ClientName
-		}
-		o.renderLoginPage(w, clientName, "Invalid Things Cloud credentials.", q.Encode())
+		o.renderLoginPage(w, client.ClientName, "Invalid Things Cloud credentials.", q.Encode())
 		return
 	}
 
 	// Generate auth code
-	code := randomString(32)
+	code, err := randomString(32)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "server_error", "failed to create authorization code")
+		return
+	}
 	authCode := &AuthCode{
 		Code:          code,
 		ClientID:      clientID,
@@ -740,93 +852,25 @@ func (o *OAuthServer) handleAuthorizePost(w http.ResponseWriter, r *http.Request
 		Password:      password,
 		CodeChallenge: codeChallenge,
 		ExpiresAt:     time.Now().Add(10 * time.Minute),
-		Used:          false,
 	}
 
 	o.mu.Lock()
 	o.authCodes[code] = authCode
 	o.mu.Unlock()
 
-	log.Printf("OAuth: auth code issued for %s (client=%s)", email, clientID)
+	log.Printf("OAuth: authorization code issued")
 
 	// Redirect to client
-	sep := "?"
-	if strings.Contains(redirectURI, "?") {
-		sep = "&"
+	redirect, err := url.Parse(redirectURI)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "server_error", "failed to create redirect")
+		return
 	}
-	location := redirectURI + sep + "code=" + code + "&state=" + state
-	o.renderSuccessPage(w, location)
-}
-
-func (o *OAuthServer) renderSuccessPage(w http.ResponseWriter, redirectURL string) {
-	html := `<!DOCTYPE html><html><head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Authorized - Things Cloud MCP</title>
-<style>
-` + sharedCSS + `
-.auth-container{
-  min-height:100vh;
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  padding:24px;
-}
-.auth-card{
-  width:100%;
-  max-width:380px;
-  background:var(--surface);
-  border:1px solid var(--divider);
-  border-radius:var(--radius);
-  padding:40px 32px;
-  box-shadow:0 2px 12px rgba(0,0,0,0.06);
-  text-align:center;
-}
-.auth-icon{
-  display:flex;
-  justify-content:center;
-  margin-bottom:24px;
-}
-.auth-title{
-  font-size:20px;
-  font-weight:700;
-  letter-spacing:-0.3px;
-  margin-bottom:8px;
-}
-.auth-subtitle{
-  font-size:14px;
-  color:var(--text-secondary);
-  line-height:1.5;
-}
-@keyframes spin{to{transform:rotate(360deg)}}
-.spinner{
-  width:20px;height:20px;
-  border:2px solid var(--divider);
-  border-top-color:var(--blue);
-  border-radius:50%;
-  animation:spin 0.8s linear infinite;
-  display:inline-block;
-  vertical-align:middle;
-  margin-right:8px;
-}
-</style>
-</head>
-<body>
-<div class="auth-container">
-  <div class="auth-card">
-    <div class="auth-icon">` + `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="48" height="48" fill="none">
-  <circle cx="32" cy="32" r="28" fill="#34C759"/>
-  <polyline points="20,33 28,41 44,25" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-</svg>` + `</div>
-    <div class="auth-title">Authorization Successful</div>
-    <div class="auth-subtitle">You can close this window.</div>
-  </div>
-</div>
-<script>setTimeout(function(){window.location.href="` + "{{redirect_url}}" + `"},1500);</script>
-</body></html>`
-	html = strings.Replace(html, "{{redirect_url}}", redirectURL, 1)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(html))
+	values := redirect.Query()
+	values.Set("code", code)
+	values.Set("state", state)
+	redirect.RawQuery = values.Encode()
+	http.Redirect(w, r, redirect.String(), http.StatusFound)
 }
 
 // ---------------------------------------------------------------------------
@@ -838,7 +882,9 @@ func (o *OAuthServer) handleToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	o.pruneExpiredAuthCodes(time.Now())
 
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	if err := r.ParseForm(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", "invalid form body")
 		return
@@ -873,12 +919,8 @@ func (o *OAuthServer) handleAuthCodeGrant(w http.ResponseWriter, r *http.Request
 		writeJSONError(w, http.StatusBadRequest, "invalid_grant", "unknown authorization code")
 		return
 	}
-	if ac.Used {
-		o.mu.Unlock()
-		writeJSONError(w, http.StatusBadRequest, "invalid_grant", "authorization code already used")
-		return
-	}
 	if time.Now().After(ac.ExpiresAt) {
+		delete(o.authCodes, code)
 		o.mu.Unlock()
 		writeJSONError(w, http.StatusBadRequest, "invalid_grant", "authorization code expired")
 		return
@@ -901,22 +943,21 @@ func (o *OAuthServer) handleAuthCodeGrant(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	ac.Used = true
 	email := ac.Email
 	password := ac.Password
-
+	delete(o.authCodes, code)
 	o.mu.Unlock()
 
 	if err := o.persistCredential(email, password); err != nil {
-		o.mu.Lock()
-		ac.Used = false
-		o.mu.Unlock()
 		writeJSONError(w, http.StatusInternalServerError, "server_error", "failed to store credentials securely")
 		return
 	}
 
 	// Generate tokens
-	base := getBaseURL(r)
+	base, ok := requestBaseURL(w, r)
+	if !ok {
+		return
+	}
 	accessToken, err := o.createJWT(map[string]any{
 		"sub":   email,
 		"iss":   base,
@@ -925,14 +966,15 @@ func (o *OAuthServer) handleAuthCodeGrant(w http.ResponseWriter, r *http.Request
 		"scope": "things:manage",
 	})
 	if err != nil {
-		o.mu.Lock()
-		ac.Used = false
-		o.mu.Unlock()
 		writeJSONError(w, http.StatusInternalServerError, "server_error", "failed to create access token")
 		return
 	}
 
-	refreshTok := randomString(32)
+	refreshTok, err := randomString(32)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "server_error", "failed to create refresh token")
+		return
+	}
 	rt := &RefreshToken{
 		Token:     refreshTok,
 		Email:     email,
@@ -941,9 +983,6 @@ func (o *OAuthServer) handleAuthCodeGrant(w http.ResponseWriter, r *http.Request
 		ExpiresAt: time.Now().Add(30 * 24 * time.Hour), // 30 days
 	}
 	if err := o.persistRefreshToken(rt); err != nil {
-		o.mu.Lock()
-		ac.Used = false
-		o.mu.Unlock()
 		writeJSONError(w, http.StatusInternalServerError, "server_error", "failed to store refresh token securely")
 		return
 	}
@@ -952,7 +991,7 @@ func (o *OAuthServer) handleAuthCodeGrant(w http.ResponseWriter, r *http.Request
 	o.refreshTokens[refreshTokenKey(refreshTok)] = rt
 	o.mu.Unlock()
 
-	log.Printf("OAuth: tokens issued for %s", email)
+	log.Printf("OAuth: tokens issued")
 
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -986,6 +1025,15 @@ func (o *OAuthServer) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Req
 		writeJSONError(w, http.StatusBadRequest, "invalid_grant", "refresh token expired")
 		return
 	}
+	if !o.um.emailAllowed(rt.Email) {
+		delete(o.refreshTokens, refreshKey)
+		o.mu.Unlock()
+		if _, err := o.db.Exec(`DELETE FROM refresh_tokens WHERE token=?`, refreshKey); err != nil {
+			log.Printf("OAuth: failed to revoke disallowed refresh token")
+		}
+		writeJSONError(w, http.StatusBadRequest, "invalid_grant", "refresh token is no longer authorized")
+		return
+	}
 
 	email := rt.Email
 	password := rt.Password
@@ -1002,7 +1050,11 @@ func (o *OAuthServer) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Req
 	}
 
 	// Generate new tokens
-	base := getBaseURL(r)
+	base, ok := requestBaseURL(w, r)
+	if !ok {
+		restoreOldToken()
+		return
+	}
 	accessToken, err := o.createJWT(map[string]any{
 		"sub":   email,
 		"iss":   base,
@@ -1016,7 +1068,12 @@ func (o *OAuthServer) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	newRefreshTok := randomString(32)
+	newRefreshTok, err := randomString(32)
+	if err != nil {
+		restoreOldToken()
+		writeJSONError(w, http.StatusInternalServerError, "server_error", "failed to create refresh token")
+		return
+	}
 	newRT := &RefreshToken{
 		Token:     newRefreshTok,
 		Email:     email,
@@ -1034,7 +1091,7 @@ func (o *OAuthServer) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Req
 	o.refreshTokens[refreshTokenKey(newRefreshTok)] = newRT
 	o.mu.Unlock()
 
-	log.Printf("OAuth: tokens refreshed for %s", email)
+	log.Printf("OAuth: tokens refreshed")
 
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{

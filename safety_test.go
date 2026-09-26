@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -568,6 +569,15 @@ func TestDiagnoseUsesAuthoritativeHistoryAndFixedPagination(t *testing.T) {
 	resolveDetails := resolve.Details.(map[string]any)
 	if same, _ := resolveDetails["selectedIsSameAsOwn"].(bool); !same {
 		t.Fatalf("diagnostic selected non-authoritative history: %#v", resolveDetails)
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("marshal diagnostic report: %v", err)
+	}
+	for _, secret := range []string{fc.historyID, "Visible", "historyKey", "ownHistoryKey", "selectedHistory"} {
+		if strings.Contains(string(encoded), secret) {
+			t.Fatalf("diagnostic report leaked %q: %s", secret, encoded)
+		}
 	}
 }
 

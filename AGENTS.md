@@ -17,9 +17,12 @@ Environment variables:
 
 - `PORT`: HTTP port.
 - `DATA_DIR`: SQLite and credential-key directory (default `data/`).
-- `JWT_SECRET`: base64 JWT signing key; generated when absent.
+- `JWT_SECRET`: high-entropy JWT signing secret of at least 32 characters; generated when absent.
 - `CREDENTIALS_SECRET`: durable high-entropy secret used to derive the AES key for Things passwords at rest. When absent, the server creates `DATA_DIR/credentials.key` with mode `0600`.
 - `THINGS_DEBUG`: SDK debug logging.
+- `PUBLIC_BASE_URL`: required public HTTPS origin; loopback HTTP is allowed for local development.
+- `ALLOWED_THINGS_EMAIL`: required single-account allowlist for this personal deployment.
+- `ENABLE_DIAGNOSTIC_SHARING`: enables unauthenticated seven-day links for redacted diagnostic reports; disabled by default.
 
 ## Architecture and safety invariants
 
@@ -51,7 +54,7 @@ Writes continue to use the unofficial Things Cloud endpoint so the server remain
 - Recurring creation is a single atomic commit containing a recurrence template and its visible instance.
 - Permanent area, tag, and checklist deletion requires `confirm=true`; stopping recurrence requires `confirm_destructive=true`.
 
-OAuth persistence encrypts Things passwords with AES-GCM and stores refresh-token hashes only. Startup migrates legacy plaintext rows. Never log credentials, response bodies that may contain credentials, encryption keys, or bearer tokens. If encrypted rows exist but the key is missing, startup must fail rather than generate an unrecoverable replacement.
+OAuth persistence encrypts Things passwords with AES-GCM and stores refresh-token hashes only. Startup migrates legacy plaintext rows. Never log credentials, history identifiers, response bodies, encryption keys, bearer tokens, or task content. If encrypted rows exist but the key is missing, startup must fail rather than generate an unrecoverable replacement.
 
 ## MCP tools
 
@@ -79,8 +82,6 @@ Before any deployment that migrates OAuth data:
 4. Retain the database backup and matching credential key for rollback.
 
 Use `THINGS_BASIC_AUTH` for local curl examples; never place an email/password or encoded credential in source files, shell history, or logs.
-
-The production service runs as the `wenbo` user service `things-mcp` on `wenbo@e.wenbo.io`, with its binary and working directory under `/home/wenbo/things-cloud-mcp` and MCP port `28063`. Cross-compile with `GOOS=linux GOARCH=amd64`, copy a staged binary, preserve a consistent OAuth database plus the matching credential key, and restart with `systemctl --user restart things-mcp`. Never replace the production binary before the rollback artifacts are verified.
 
 OAuth 2.1 uses PKCE. Persistent state is in `DATA_DIR/oauth.db`; endpoints include `/authorize`, `/token`, `/register`, and `/.well-known/oauth-*`.
 

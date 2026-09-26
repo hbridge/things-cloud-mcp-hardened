@@ -1274,12 +1274,12 @@ var DocsPageHTML = `<!DOCTYPE html>
 
 func handleLandingPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(LandingPagePreviewHTML))
+	w.Write([]byte(strings.ReplaceAll(LandingPagePreviewHTML, "https://thingscloudmcp.com", getBaseURL(r))))
 }
 
 func handleDocsPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(DocsPagePreviewHTML))
+	w.Write([]byte(strings.ReplaceAll(DocsPagePreviewHTML, "https://thingscloudmcp.com", getBaseURL(r))))
 }
 
 // HowItWorksPageHTML contains the full HTML "How it Works" page.
@@ -1567,7 +1567,7 @@ var HowItWorksPageHTML = `<!DOCTYPE html>
 
 func handleHowItWorksPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(HowItWorksPageHTML))
+	w.Write([]byte(strings.ReplaceAll(HowItWorksPageHTML, "https://thingscloudmcp.com", getBaseURL(r))))
 }
 
 // faviconSVG is a standalone SVG used as the favicon (cloud with checkmark).

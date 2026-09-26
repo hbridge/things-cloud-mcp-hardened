@@ -4,3 +4,15 @@ things-mcp
 .claude/
 .worktrees/
 fly.toml
+.git/
+.github/
+.Codex/
+CLAUDE.md
+AGENTS.md
+docs/
+**/docs/
+**/*_test.go
+**/example/
+**/tapes/
+*.png
+*.md
