@@ -4491,7 +4491,7 @@ func serveDiagReportPage(w http.ResponseWriter, reportJSON string) {
 	w.Write([]byte(reportJSON))
 }
 
-func hardenedHTTPHandler(next http.Handler, expectedHost string) http.Handler {
+func hardenedHTTPHandler(next http.Handler, expectedHost, publicOrigin string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
 			w.Header().Set("Cache-Control", "no-store")
@@ -4502,7 +4502,7 @@ func hardenedHTTPHandler(next http.Handler, expectedHost string) http.Handler {
 			http.Error(w, "invalid host", http.StatusMisdirectedRequest)
 			return
 		}
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' "+publicOrigin)
 		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 		w.Header().Set("Referrer-Policy", "no-referrer")
@@ -4663,7 +4663,7 @@ func main() {
 
 	httpServer := &http.Server{
 		Addr:              addr,
-		Handler:           hardenedHTTPHandler(mux, publicURL.Host),
+		Handler:           hardenedHTTPHandler(mux, publicURL.Host, publicBaseURL),
 		ReadHeaderTimeout: 30 * time.Second,
 		WriteTimeout:      5 * time.Minute,
 		IdleTimeout:       120 * time.Second,

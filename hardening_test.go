@@ -96,7 +96,7 @@ func TestPublicBaseURLValidation(t *testing.T) {
 
 func TestHardenedHTTPHandlerRejectsUnexpectedHost(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
-	handler := hardenedHTTPHandler(next, "personal.example")
+	handler := hardenedHTTPHandler(next, "personal.example", "https://personal.example")
 
 	req := httptest.NewRequest(http.MethodGet, "https://attacker.example/", nil)
 	recorder := httptest.NewRecorder()
@@ -112,7 +112,7 @@ func TestHealthCheckDoesNotExposeApplication(t *testing.T) {
 		nextCalled = true
 		w.WriteHeader(http.StatusInternalServerError)
 	})
-	handler := hardenedHTTPHandler(next, "personal.example")
+	handler := hardenedHTTPHandler(next, "personal.example", "https://personal.example")
 
 	req := httptest.NewRequest(http.MethodGet, "http://internal.fly/healthz", nil)
 	recorder := httptest.NewRecorder()
@@ -122,6 +122,21 @@ func TestHealthCheckDoesNotExposeApplication(t *testing.T) {
 	}
 	if nextCalled {
 		t.Fatal("health check reached the application handler")
+	}
+}
+
+func TestHardenedHTTPHandlerAllowsOAuthFormPostToPublicOrigin(t *testing.T) {
+	handler := hardenedHTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}), "personal.example", "https://personal.example")
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "https://personal.example/authorize", nil)
+	handler.ServeHTTP(recorder, req)
+
+	policy := recorder.Header().Get("Content-Security-Policy")
+	if !strings.Contains(policy, "form-action 'self' https://personal.example") {
+		t.Fatalf("CSP form-action does not allow the configured public origin: %q", policy)
 	}
 }
 
