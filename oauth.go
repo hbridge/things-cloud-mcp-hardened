@@ -793,6 +793,7 @@ func (o *OAuthServer) handleAuthorizeGet(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	o.setAuthorizationFormCSP(w, q.Get("redirect_uri"))
 	o.renderLoginPage(w, client.ClientName, "", q.Encode())
 }
 
@@ -814,6 +815,7 @@ func (o *OAuthServer) handleAuthorizePost(w http.ResponseWriter, r *http.Request
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	o.setAuthorizationFormCSP(w, redirectURI)
 
 	email := r.PostFormValue("email")
 	password := r.PostFormValue("password")
@@ -871,6 +873,17 @@ func (o *OAuthServer) handleAuthorizePost(w http.ResponseWriter, r *http.Request
 	values.Set("state", state)
 	redirect.RawQuery = values.Encode()
 	http.Redirect(w, r, redirect.String(), http.StatusFound)
+}
+
+func (o *OAuthServer) setAuthorizationFormCSP(w http.ResponseWriter, redirectURI string) {
+	formActions := []string{"'self'"}
+	if o.publicBaseURL != "" {
+		formActions = append(formActions, o.publicBaseURL)
+	}
+	if redirect, err := url.Parse(redirectURI); err == nil && redirect.Scheme != "" && redirect.Host != "" {
+		formActions = append(formActions, redirect.Scheme+"://"+redirect.Host)
+	}
+	w.Header().Set("Content-Security-Policy", contentSecurityPolicy(formActions...))
 }
 
 // ---------------------------------------------------------------------------

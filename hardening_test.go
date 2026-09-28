@@ -140,6 +140,26 @@ func TestHardenedHTTPHandlerAllowsOAuthFormPostToPublicOrigin(t *testing.T) {
 	}
 }
 
+func TestAuthorizeCSPAllowsValidatedLoopbackRedirectOrigin(t *testing.T) {
+	o := &OAuthServer{
+		publicBaseURL: "https://personal.example",
+		clients: map[string]*OAuthClient{
+			"client-1": {ClientID: "client-1", RedirectURIs: []string{"http://127.0.0.1:12345/callback"}},
+		},
+	}
+	q := validAuthorizationQuery()
+	q.Set("redirect_uri", "http://127.0.0.1:12345/callback")
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "https://personal.example/authorize?"+q.Encode(), nil)
+	o.handleAuthorizeGet(recorder, req)
+
+	policy := recorder.Header().Get("Content-Security-Policy")
+	if !strings.Contains(policy, "form-action 'self' https://personal.example http://127.0.0.1:12345") {
+		t.Fatalf("CSP form-action does not allow the validated callback origin: %q", policy)
+	}
+}
+
 func TestDiagnosticSharingIsOffByDefault(t *testing.T) {
 	for _, value := range []string{"", "false", "0", "not-a-boolean"} {
 		t.Setenv("ENABLE_DIAGNOSTIC_SHARING", value)
