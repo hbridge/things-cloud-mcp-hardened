@@ -496,15 +496,17 @@ func TestStateUpdateRejectsMalformedKnownItem(t *testing.T) {
 }
 
 func TestStateUpdateRejectsUnknownKind(t *testing.T) {
-	s := NewState()
-	err := s.Update(things.Item{
-		UUID:   "future-item",
-		Kind:   things.ItemKind("Task7"),
-		Action: things.ItemActionCreated,
-		P:      []byte(`{}`),
-	})
-	if err == nil {
-		t.Fatal("expected unknown kind error")
+	for _, kind := range []things.ItemKind{"Task7", "-"} {
+		s := NewState()
+		err := s.Update(things.Item{
+			UUID:   "future-item",
+			Kind:   kind,
+			Action: things.ItemActionCreated,
+			P:      []byte(`{}`),
+		})
+		if err == nil {
+			t.Fatalf("expected unknown kind %q error", kind)
+		}
 	}
 }
 
@@ -520,6 +522,14 @@ func TestStateUpdateIgnoresVersionedSettings(t *testing.T) {
 		if err != nil {
 			t.Fatalf("settings kind %q blocked state update: %v", kind, err)
 		}
+	}
+	if err := s.Update(things.Item{
+		UUID:   "Settings",
+		Kind:   "-",
+		Action: things.ItemAction(99),
+		P:      []byte(`not-json`),
+	}); err != nil {
+		t.Fatalf("settings marker blocked state update: %v", err)
 	}
 	if len(s.Tasks) != 0 || len(s.Areas) != 0 || len(s.Tags) != 0 || len(s.CheckListItems) != 0 {
 		t.Fatalf("settings changed task graph: %#v", s)

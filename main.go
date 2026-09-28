@@ -2283,11 +2283,20 @@ func (t *ThingsMCP) diagnoseSteps4to7(history *thingscloud.History, report *diag
 
 		// Report item type distribution and tail items
 		kindCounts := map[string]int{}
+		settingsMarkers := 0
 		for _, item := range allItems {
 			kindCounts[string(item.Kind)]++
+			if item.UUID == "Settings" && !thingscloud.IsSettingsKind(item.Kind) {
+				settingsMarkers++
+			}
 		}
 		step4.Log = append(step4.Log, fmt.Sprintf("Item types: %v", kindCounts))
 		step4.Details.(map[string]any)["itemTypes"] = kindCounts
+		if settingsMarkers > 0 {
+			step4.Details.(map[string]any)["ignoredSettingsMarkers"] = settingsMarkers
+			step4.Log = append(step4.Log, fmt.Sprintf("Ignored %d non-entity Settings metadata marker(s)", settingsMarkers))
+			*warnings = append(*warnings, fmt.Sprintf("Step 4: ignored %d non-entity Settings metadata marker(s)", settingsMarkers))
+		}
 
 		// Report last 5 items (the tail of the stream)
 		type tailItem struct {
@@ -2354,6 +2363,11 @@ func (t *ThingsMCP) diagnoseSteps4to7(history *thingscloud.History, report *diag
 	}
 
 	step5.Status = "pass"
+	t.mu.Lock()
+	t.client = history.Client
+	t.history = history
+	t.state = state
+	t.mu.Unlock()
 	step5.Details = map[string]any{
 		"tasks":          len(state.Tasks),
 		"areas":          len(state.Areas),
@@ -4450,12 +4464,12 @@ func defineTools(um *UserManager) []server.ServerTool {
 				if err != nil {
 					return errResult(err.Error()), nil
 				}
-				t, err := getUserFromContext(ctx, um)
-				if err != nil {
-					return errResult(err.Error()), nil
+				if !um.emailAllowed(email) {
+					return errResult("account is not allowed on this server"), nil
 				}
-				t.opMu.Lock()
-				defer t.opMu.Unlock()
+				// Diagnostics must not initialize the normal cached user session:
+				// initialization performs the same full rebuild this tool diagnoses.
+				t := &ThingsMCP{proxyURL: um.proxyForEmail(email)}
 				report := t.handleDiagnose(email, password)
 
 				// Store report and generate shareable URL

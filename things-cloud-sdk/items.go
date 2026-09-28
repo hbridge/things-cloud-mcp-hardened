@@ -18,6 +18,14 @@ type Item struct {
 	Action ItemAction      `json:"t"`
 }
 
+// IsSettingsItem reports whether an event is account settings metadata rather
+// than a task-graph entity. Most settings events use a versioned Settings kind,
+// but Things Cloud also emits marker records keyed by the stable "Settings" ID
+// with a non-entity kind such as "-".
+func IsSettingsItem(item Item) bool {
+	return item.UUID == "Settings" || IsSettingsKind(item.Kind)
+}
+
 type itemsResponse struct {
 	Items                  []map[string]Item `json:"items"`
 	LatestTotalContentSize int               `json:"latest-total-content-size"`
