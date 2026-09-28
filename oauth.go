@@ -1272,7 +1272,7 @@ func (o *OAuthServer) renderLoginPage(w http.ResponseWriter, clientName, errMsg,
 		strings.Replace(
 			strings.Replace(authorizePageHTML, "{{subtitle}}", subtitle, 1),
 			"{{error}}", errorHTML, 1),
-		"{{query}}", queryString, 1)
+		"{{query}}", htmlEscape(queryString), 1)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(html))
 }

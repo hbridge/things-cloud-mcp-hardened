@@ -1116,7 +1116,7 @@ func (um *UserManager) proxyForEmail(email string) *url.URL {
 		return nil
 	}
 
-	idx := int(fnv32(email) % uint32(len(um.proxyURLs)))
+	idx := int(uint64(fnv32(email)) % uint64(len(um.proxyURLs)))
 	return um.proxyURLs[idx]
 }
 
@@ -2284,10 +2284,14 @@ func (t *ThingsMCP) diagnoseSteps4to7(history *thingscloud.History, report *diag
 		// Report item type distribution and tail items
 		kindCounts := map[string]int{}
 		settingsMarkers := 0
+		metadataCounts := map[string]int{}
 		for _, item := range allItems {
 			kindCounts[string(item.Kind)]++
 			if item.UUID == "Settings" && !thingscloud.IsSettingsKind(item.Kind) {
 				settingsMarkers++
+			}
+			if thingscloud.IsMetadataItem(item) && !thingscloud.IsSettingsItem(item) {
+				metadataCounts[string(item.Kind)]++
 			}
 		}
 		step4.Log = append(step4.Log, fmt.Sprintf("Item types: %v", kindCounts))
@@ -2296,6 +2300,10 @@ func (t *ThingsMCP) diagnoseSteps4to7(history *thingscloud.History, report *diag
 			step4.Details.(map[string]any)["ignoredSettingsMarkers"] = settingsMarkers
 			step4.Log = append(step4.Log, fmt.Sprintf("Ignored %d non-entity Settings metadata marker(s)", settingsMarkers))
 			*warnings = append(*warnings, fmt.Sprintf("Step 4: ignored %d non-entity Settings metadata marker(s)", settingsMarkers))
+		}
+		if len(metadataCounts) > 0 {
+			step4.Details.(map[string]any)["ignoredMetadataTypes"] = metadataCounts
+			step4.Log = append(step4.Log, fmt.Sprintf("Ignored non-entity metadata types: %v", metadataCounts))
 		}
 
 		// Report last 5 items (the tail of the stream)

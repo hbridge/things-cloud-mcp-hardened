@@ -157,7 +157,9 @@ func (c *Client) Histories() ([]*History, error) {
 		return nil, err
 	}
 	var keys []string
-	json.Unmarshal(bs, &keys)
+	if err := json.Unmarshal(bs, &keys); err != nil {
+		return nil, fmt.Errorf("decode history keys: %w", err)
+	}
 
 	var histories = make([]*History, len(keys))
 	for i, key := range keys {
@@ -196,7 +198,9 @@ func (c *Client) CreateHistory() (*History, error) {
 		return nil, err
 	}
 	var v createHistoryResponse
-	json.Unmarshal(bs, &v)
+	if err := json.Unmarshal(bs, &v); err != nil {
+		return nil, fmt.Errorf("decode create-history response: %w", err)
+	}
 	return &History{
 		Client: c,
 		ID:     v.Key,

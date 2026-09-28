@@ -2,7 +2,9 @@ package thingscloud
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestNote_FullText(t *testing.T) {
@@ -45,6 +47,14 @@ func TestNote_ApplyPatch(t *testing.T) {
 	}
 }
 
+func TestNote_ApplyPatch_UsesUTF8ByteOffsets(t *testing.T) {
+	original := "Native Task7 note α 🚀\nSecond line."
+	patch := NotePatch{Position: 26, Length: 5, Replacement: "Update"}
+	if got := ApplyPatches(original, []NotePatch{patch}); got != "Native Task7 note α 🚀\nUpdated line." {
+		t.Fatalf("byte-offset patch = %q", got)
+	}
+}
+
 func TestNote_ApplyPatch_PositionBeyondLength(t *testing.T) {
 	// Patch position is beyond the string — should not panic
 	result := ApplyPatches("", []NotePatch{{Position: 10, Length: 0, Replacement: "hello"}})
@@ -68,5 +78,25 @@ func TestNote_ApplyMultiplePatches(t *testing.T) {
 	result := ApplyPatches(original, patches)
 	if result != "XBCDEF" {
 		t.Errorf("expected 'XBCDEF', got '%s'", result)
+	}
+}
+
+func TestApplyPatchesCheckedRejectsInvalidUTF8(t *testing.T) {
+	_, err := ApplyPatchesChecked("α", []NotePatch{{Position: 1, Length: 1}})
+	if err == nil || !strings.Contains(err.Error(), "patch 0") {
+		t.Fatalf("invalid UTF-8 patch error = %v", err)
+	}
+}
+
+func TestApplyPatchesCheckedRejectsInvalidIntermediateResult(t *testing.T) {
+	patches := []NotePatch{
+		{Position: 1, Length: 1},
+		{Position: 0, Length: 1},
+	}
+	if got := ApplyPatches("α", patches); got != "" || !utf8.ValidString(got) {
+		t.Fatalf("test setup produced %q", got)
+	}
+	if _, err := ApplyPatchesChecked("α", patches); err == nil {
+		t.Fatal("accepted invalid intermediate UTF-8")
 	}
 }

@@ -3,8 +3,8 @@ package memory
 import (
 	"encoding/json"
 	"fmt"
-	// "fmt"
 	"sort"
+	"time"
 
 	things "github.com/arthursoares/things-cloud-sdk"
 )
@@ -35,10 +35,10 @@ func NewState() *State {
 // records, so replay must normalize both object keys and relationship fields.
 func isLegacyItemKind(kind things.ItemKind) bool {
 	switch kind {
-	case things.ItemKindTask4, things.ItemKindTask3, things.ItemKindTaskPlain,
+	case things.ItemKindTask4, things.ItemKindTask3, things.ItemKindTask2, things.ItemKindTaskPlain,
 		things.ItemKindChecklistItem, things.ItemKindChecklistItem2,
 		things.ItemKindArea, things.ItemKindAreaPlain,
-		things.ItemKindTag, things.ItemKindTagPlain,
+		things.ItemKindTag, things.ItemKindTag2, things.ItemKindTagPlain,
 		things.ItemKindTombstonePlain:
 		return true
 	default:
@@ -187,8 +187,16 @@ func (s *State) updateTask(item things.TaskActionItem, rawP json.RawMessage) *th
 					t.DeadlineDate = nil
 				case "sp":
 					t.CompletionDate = nil
+				case "cd":
+					t.CreationDate = time.Time{}
 				case "md":
 					t.ModificationDate = nil
+				case "ar":
+					t.AreaIDs = nil
+				case "pr":
+					t.ParentTaskIDs = nil
+				case "agr":
+					t.ActionGroupIDs = nil
 				case "ato":
 					t.AlarmTimeOffset = nil
 				case "tir":
@@ -197,6 +205,10 @@ func (s *State) updateTask(item things.TaskActionItem, rawP json.RawMessage) *th
 					t.Note = ""
 				case "tg":
 					t.TagIDs = nil
+				case "rt":
+					t.RecurrenceIDs = nil
+				case "dl":
+					t.DelegateIDs = nil
 				case "rr":
 					t.Repeater = nil
 				}
@@ -292,11 +304,26 @@ func (s *State) updateTag(item things.TagActionItem) *things.Tag {
 
 // Update applies all items to update the aggregated state
 func (s *State) Update(items ...things.Item) error {
+	if err := things.ValidateTaskReadKinds(items); err != nil {
+		return err
+	}
+
 	// Validate the whole batch first. Advancing a sync cursor after silently
 	// skipping a future or malformed event would make the local state permanently
-	// incomplete, so updates are all-or-nothing with respect to decoding.
-	for _, rawItem := range items {
-		if things.IsSettingsItem(rawItem) {
+	// incomplete, so updates are all-or-nothing with respect to decoding and
+	// note-delta application.
+	taskPayloads := make([]things.TaskReadPayload, len(items))
+	decodedTaskPayload := make([]bool, len(items))
+	resolvedTaskNotes := make([]string, len(items))
+	resolvedTaskNote := make([]bool, len(items))
+	type noteState struct {
+		value  string
+		exists bool
+	}
+	notes := make(map[string]noteState)
+
+	for i, rawItem := range items {
+		if things.IsMetadataItem(rawItem) {
 			continue
 		}
 		if rawItem.Action != things.ItemActionCreated && rawItem.Action != things.ItemActionModified && rawItem.Action != things.ItemActionDeleted {
@@ -304,26 +331,75 @@ func (s *State) Update(items ...things.Item) error {
 		}
 		var target any
 		switch rawItem.Kind {
-		case things.ItemKindTask, things.ItemKindTask4, things.ItemKindTask3, things.ItemKindTaskPlain:
-			target = &things.TaskActionItemPayload{}
+		case things.ItemKindTask7, things.ItemKindTask, things.ItemKindTask4, things.ItemKindTask3, things.ItemKindTask2, things.ItemKindTaskPlain:
+			legacy := isLegacyItemKind(rawItem.Kind)
+			id := rawItem.UUID
+			if legacy && things.ValidateUUID(id) != nil {
+				id = things.EncodeLegacyIdentifier(id)
+			}
+			if rawItem.Action == things.ItemActionDeleted {
+				notes[id] = noteState{}
+				continue
+			}
+			payload, err := things.DecodeTaskReadPayload(rawItem.P)
+			if err != nil {
+				return fmt.Errorf("decode item %s (%s action=%d): %w", rawItem.UUID, rawItem.Kind, rawItem.Action, err)
+			}
+			taskPayloads[i] = payload
+			decodedTaskPayload[i] = true
+
+			current := ""
+			if state, ok := notes[id]; ok {
+				if state.exists {
+					current = state.value
+				}
+			} else if task := s.Tasks[id]; task != nil {
+				current = task.Note
+			}
+			resolved, err := payload.ResolveNote(current)
+			if err != nil {
+				return fmt.Errorf("decode item %s (%s action=%d): %w", rawItem.UUID, rawItem.Kind, rawItem.Action, err)
+			}
+			resolvedTaskNotes[i] = resolved
+			resolvedTaskNote[i] = true
+			notes[id] = noteState{value: resolved, exists: true}
+			continue
 		case things.ItemKindChecklistItem, things.ItemKindChecklistItem2, things.ItemKindChecklistItem3:
+			if rawItem.Action == things.ItemActionDeleted {
+				continue
+			}
 			target = &things.CheckListActionItemPayload{}
 		case things.ItemKindArea, things.ItemKindArea3, things.ItemKindAreaPlain:
+			if rawItem.Action == things.ItemActionDeleted {
+				continue
+			}
 			target = &things.AreaActionItemPayload{}
-		case things.ItemKindTag, things.ItemKindTag4, things.ItemKindTagPlain:
+		case things.ItemKindTag, things.ItemKindTag4, things.ItemKindTag2, things.ItemKindTagPlain:
+			if rawItem.Action == things.ItemActionDeleted {
+				continue
+			}
 			target = &things.TagActionItemPayload{}
 		case things.ItemKindTombstone, things.ItemKindTombstonePlain:
-			target = &things.TombstoneActionItemPayload{}
+			var payload things.TombstoneActionItemPayload
+			if err := json.Unmarshal(rawItem.P, &payload); err != nil {
+				return fmt.Errorf("decode item %s (%s action=%d): %w", rawItem.UUID, rawItem.Kind, rawItem.Action, err)
+			}
+			oid := payload.DeletedObjectID
+			if isLegacyItemKind(rawItem.Kind) && things.ValidateUUID(oid) != nil {
+				oid = things.EncodeLegacyIdentifier(oid)
+			}
+			notes[oid] = noteState{}
+			continue
 		default:
 			return fmt.Errorf("item %s has unsupported kind %q", rawItem.UUID, rawItem.Kind)
 		}
 		if err := json.Unmarshal(rawItem.P, target); err != nil {
-			return fmt.Errorf("decode item %s (%s): %w", rawItem.UUID, rawItem.Kind, err)
+			return fmt.Errorf("decode item %s (%s action=%d): %w", rawItem.UUID, rawItem.Kind, rawItem.Action, err)
 		}
 	}
 
-	for _, rawItem := range items {
-		if things.IsSettingsItem(rawItem) {
+	for i, rawItem := range items {
+		if things.IsMetadataItem(rawItem) {
 			continue
 		}
 		legacy := isLegacyItemKind(rawItem.Kind)
@@ -331,9 +407,12 @@ func (s *State) Update(items ...things.Item) error {
 			rawItem.UUID = things.EncodeLegacyIdentifier(rawItem.UUID)
 		}
 		switch rawItem.Kind {
-		case things.ItemKindTask, things.ItemKindTask4, things.ItemKindTask3, things.ItemKindTaskPlain:
+		case things.ItemKindTask7, things.ItemKindTask, things.ItemKindTask4, things.ItemKindTask3, things.ItemKindTask2, things.ItemKindTaskPlain:
 			item := things.TaskActionItem{Item: rawItem}
-			_ = json.Unmarshal(rawItem.P, &item.P)
+			payload := taskPayloads[i]
+			if decodedTaskPayload[i] {
+				item.P = payload.TaskActionItemPayload
+			}
 			if legacy {
 				encodeLegacyTaskReferences(&item.P)
 			}
@@ -342,7 +421,12 @@ func (s *State) Update(items ...things.Item) error {
 			case things.ItemActionCreated:
 				fallthrough
 			case things.ItemActionModified:
-				s.Tasks[item.UUID()] = s.updateTask(item, rawItem.P)
+				task := s.updateTask(item, rawItem.P)
+				if resolvedTaskNote[i] {
+					task.Note = resolvedTaskNotes[i]
+				}
+				payload.ApplyNulls(task)
+				s.Tasks[item.UUID()] = task
 			case things.ItemActionDeleted:
 				delete(s.Tasks, item.UUID())
 			default:
@@ -386,7 +470,7 @@ func (s *State) Update(items ...things.Item) error {
 				// Unsupported action: skip
 			}
 
-		case things.ItemKindTag, things.ItemKindTag4, things.ItemKindTagPlain:
+		case things.ItemKindTag, things.ItemKindTag4, things.ItemKindTag2, things.ItemKindTagPlain:
 			item := things.TagActionItem{Item: rawItem}
 			_ = json.Unmarshal(rawItem.P, &item.P)
 			if legacy && item.P.ParentTagIDs != nil {

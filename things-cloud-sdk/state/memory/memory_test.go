@@ -496,7 +496,7 @@ func TestStateUpdateRejectsMalformedKnownItem(t *testing.T) {
 }
 
 func TestStateUpdateRejectsUnknownKind(t *testing.T) {
-	for _, kind := range []things.ItemKind{"Task7", "-"} {
+	for _, kind := range []things.ItemKind{"Task8", "-"} {
 		s := NewState()
 		err := s.Update(things.Item{
 			UUID:   "future-item",
@@ -507,6 +507,97 @@ func TestStateUpdateRejectsUnknownKind(t *testing.T) {
 		if err == nil {
 			t.Fatalf("expected unknown kind %q error", kind)
 		}
+	}
+}
+
+func TestStateUpdateAcceptsPayloadlessEntityDeletes(t *testing.T) {
+	for _, kind := range []things.ItemKind{
+		things.ItemKindTask, things.ItemKindTaskPlain,
+		things.ItemKindChecklistItem3, things.ItemKindChecklistItem,
+		things.ItemKindArea3, things.ItemKindAreaPlain,
+		things.ItemKindTag4, things.ItemKindTagPlain,
+	} {
+		s := NewState()
+		if err := s.Update(things.Item{
+			UUID:   "3FED02C5-294E-4620-8FF8-5562512C1C14",
+			Kind:   kind,
+			Action: things.ItemActionDeleted,
+		}); err != nil {
+			t.Errorf("payloadless delete for %q failed: %v", kind, err)
+		}
+	}
+}
+
+func TestStateUpdateRejectsPayloadlessEntityCreate(t *testing.T) {
+	s := NewState()
+	if err := s.Update(things.Item{
+		UUID:   "3FED02C5-294E-4620-8FF8-5562512C1C14",
+		Kind:   things.ItemKindTaskPlain,
+		Action: things.ItemActionCreated,
+	}); err == nil {
+		t.Fatal("payloadless create was accepted")
+	}
+}
+
+func TestStateUpdateReplaysTask2IntoTask7(t *testing.T) {
+	s := NewState()
+	legacyID := "3FED02C5-294E-4620-8FF8-5562512C1C14"
+	currentID := things.EncodeLegacyIdentifier(legacyID)
+	if err := s.Update(
+		things.Item{UUID: legacyID, Kind: things.ItemKindTask2, Action: things.ItemActionCreated, P: []byte(`{"tt":"legacy"}`)},
+		things.Item{UUID: currentID, Kind: things.ItemKindTask7, Action: things.ItemActionModified, P: []byte(`{"tt":"current"}`)},
+	); err != nil {
+		t.Fatalf("mixed-generation replay failed: %v", err)
+	}
+	if len(s.Tasks) != 1 || s.Tasks[currentID] == nil || s.Tasks[currentID].Title != "current" {
+		t.Fatalf("mixed-generation task was not unified: %#v", s.Tasks)
+	}
+}
+
+func TestStateUpdateSupportsTag2(t *testing.T) {
+	s := NewState()
+	legacyID := "3FED02C5-294E-4620-8FF8-5562512C1C14"
+	currentID := things.EncodeLegacyIdentifier(legacyID)
+	if err := s.Update(things.Item{
+		UUID: legacyID, Kind: things.ItemKindTag2, Action: things.ItemActionCreated, P: []byte(`{"tt":"legacy tag"}`),
+	}); err != nil {
+		t.Fatalf("Tag2 replay failed: %v", err)
+	}
+	if s.Tags[currentID] == nil || s.Tags[currentID].Title != "legacy tag" {
+		t.Fatalf("Tag2 was not normalized: %#v", s.Tags)
+	}
+}
+
+func TestStateUpdateIgnoresKnownNonEntityMetadata(t *testing.T) {
+	for _, kind := range []things.ItemKind{things.ItemKindCommand, things.ItemKindCommand3, things.ItemKindContact2} {
+		s := NewState()
+		if err := s.Update(things.Item{UUID: "metadata", Kind: kind, Action: 99, P: []byte(`not-json`)}); err != nil {
+			t.Errorf("known metadata kind %q blocked replay: %v", kind, err)
+		}
+	}
+	s := NewState()
+	if err := s.Update(things.Item{UUID: "metadata", Kind: "Command4", Action: things.ItemActionCreated, P: []byte(`{}`)}); err == nil {
+		t.Fatal("unknown metadata generation was accepted")
+	}
+}
+
+func TestStateUpdateRejectsInvalidNoteDeltaBeforeBatchMutation(t *testing.T) {
+	s := NewState()
+	if err := s.Update(
+		things.Item{UUID: "first", Kind: things.ItemKindTask7, Action: things.ItemActionCreated, P: []byte(`{"tt":"before","nt":"safe"}`)},
+		things.Item{UUID: "unicode", Kind: things.ItemKindTask7, Action: things.ItemActionCreated, P: []byte(`{"nt":"α"}`)},
+	); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Update(
+		things.Item{UUID: "first", Kind: things.ItemKindTask7, Action: things.ItemActionModified, P: []byte(`{"tt":"after"}`)},
+		things.Item{UUID: "unicode", Kind: things.ItemKindTask7, Action: things.ItemActionModified, P: []byte(`{"nt":{"t":2,"ps":[{"p":1,"l":1,"r":""}]}}`)},
+	)
+	if err == nil {
+		t.Fatal("accepted note delta that produces invalid UTF-8")
+	}
+	if s.Tasks["first"].Title != "before" || s.Tasks["unicode"].Note != "α" {
+		t.Fatalf("rejected batch mutated state: %#v", s.Tasks)
 	}
 }
 

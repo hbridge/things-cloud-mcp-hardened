@@ -22,8 +22,12 @@ func TaskTypePtr(val TaskType) *TaskType {
 	return &val
 }
 
-// Time returns a pointer to a Time
+// Time returns a pointer to a Time. The zero time cannot be represented by the
+// Things timestamp wire format, so it returns nil.
 func Time(val time.Time) *Timestamp {
+	if val.IsZero() {
+		return nil
+	}
 	ts := Timestamp(val)
 	return &ts
 }

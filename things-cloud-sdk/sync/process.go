@@ -60,16 +60,16 @@ func (s *Syncer) processItems(items []things.Item, baseIndex int) ([]Change, err
 
 // processItem routes an item to the correct handler based on its Kind.
 func (s *Syncer) processItem(item things.Item, serverIndex int, ts time.Time) ([]Change, error) {
-	if things.IsSettingsItem(item) {
-		// Settings events are account metadata, not task-graph entities.
+	if things.IsMetadataItem(item) {
+		// Known metadata events are not task-graph entities.
 		return nil, nil
 	}
 	switch item.Kind {
-	case things.ItemKindTask, things.ItemKindTask4, things.ItemKindTask3, things.ItemKindTaskPlain:
+	case things.ItemKindTask7, things.ItemKindTask, things.ItemKindTask4, things.ItemKindTask3, things.ItemKindTask2, things.ItemKindTaskPlain:
 		return s.processTaskItem(item, serverIndex, ts)
 	case things.ItemKindArea, things.ItemKindArea3, things.ItemKindAreaPlain:
 		return s.processAreaItem(item, serverIndex, ts)
-	case things.ItemKindTag, things.ItemKindTag4, things.ItemKindTagPlain:
+	case things.ItemKindTag, things.ItemKindTag4, things.ItemKindTag2, things.ItemKindTagPlain:
 		return s.processTagItem(item, serverIndex, ts)
 	case things.ItemKindChecklistItem, things.ItemKindChecklistItem2, things.ItemKindChecklistItem3:
 		return s.processChecklistItem(item, serverIndex, ts)

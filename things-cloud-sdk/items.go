@@ -12,10 +12,12 @@ import (
 // Common items are the creation of a task, area or checklist, as well as modifying attributes
 // or marking things as done.
 type Item struct {
-	UUID   string          `json:"-"`
-	P      json.RawMessage `json:"p"`
-	Kind   ItemKind        `json:"e"`
-	Action ItemAction      `json:"t"`
+	UUID           string          `json:"-"`
+	P              json.RawMessage `json:"p"`
+	Kind           ItemKind        `json:"e"`
+	Action         ItemAction      `json:"t"`
+	ServerIndex    int             `json:"-"`
+	HasServerIndex bool            `json:"-"`
 }
 
 // IsSettingsItem reports whether an event is account settings metadata rather
@@ -24,6 +26,20 @@ type Item struct {
 // with a non-entity kind such as "-".
 func IsSettingsItem(item Item) bool {
 	return item.UUID == "Settings" || IsSettingsKind(item.Kind)
+}
+
+// IsMetadataItem reports whether an event is known account/application
+// metadata that does not contribute an entity to the task graph.
+func IsMetadataItem(item Item) bool {
+	if IsSettingsItem(item) {
+		return true
+	}
+	switch item.Kind {
+	case ItemKindCommand, ItemKindCommand3, ItemKindContact2:
+		return true
+	default:
+		return false
+	}
 }
 
 type itemsResponse struct {
@@ -101,9 +117,12 @@ func (h *History) Items(opts ItemsOptions) ([]Item, bool, error) {
 		return nil, false, fmt.Errorf("server page ends at index %d beyond current index %d", nextLoadedIndex, v.CurrentItemIndex)
 	}
 	var items = []Item{}
-	for _, m := range v.Items {
+	for offset, m := range v.Items {
+		serverIndex := opts.StartIndex + offset
 		for id, item := range m {
 			item.UUID = id
+			item.ServerIndex = serverIndex
+			item.HasServerIndex = true
 			items = append(items, item)
 		}
 	}

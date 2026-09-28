@@ -60,8 +60,10 @@ var (
 	ItemKindChecklistItem3 ItemKind = "ChecklistItem3"
 	// ItemKindTask identifies a Task or Subtask
 	ItemKindTask      ItemKind = "Task6"
+	ItemKindTask7     ItemKind = "Task7"
 	ItemKindTask4     ItemKind = "Task4"
 	ItemKindTask3     ItemKind = "Task3"
+	ItemKindTask2     ItemKind = "Task2"
 	ItemKindTaskPlain ItemKind = "Task"
 	// ItemKindArea identifies an Area
 	ItemKindArea      ItemKind = "Area2"
@@ -72,7 +74,12 @@ var (
 	// ItemKindTag identifies a Tag
 	ItemKindTag            ItemKind = "Tag3"
 	ItemKindTag4           ItemKind = "Tag4"
+	ItemKindTag2           ItemKind = "Tag2"
 	ItemKindTagPlain       ItemKind = "Tag"
+	// Non-entity history records do not contribute to the task graph.
+	ItemKindCommand  ItemKind = "Command"
+	ItemKindCommand3 ItemKind = "Command3"
+	ItemKindContact2 ItemKind = "Contact2"
 	// ItemKindTombstone is the current deletion-record kind.
 	ItemKindTombstone      ItemKind = "Tombstone2"
 	// ItemKindTombstonePlain is the legacy deletion-record kind found in older histories.
