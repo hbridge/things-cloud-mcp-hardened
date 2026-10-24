@@ -271,6 +271,19 @@ func withTodayIndexRefDate(t time.Time) taskOption {
 	}
 }
 
+func withStartBucket(bucket int) taskOption {
+	return func(p *thingscloud.TaskActionItemPayload) {
+		p.StartBucket = &bucket
+	}
+}
+
+func withRecurrenceTask(uuid string) taskOption {
+	return func(p *thingscloud.TaskActionItemPayload) {
+		ids := []string{uuid}
+		p.RecurrenceTaskIDs = &ids
+	}
+}
+
 func withNote(text string) taskOption {
 	return func(p *thingscloud.TaskActionItemPayload) {
 		note := thingscloud.Note{
