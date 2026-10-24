@@ -3866,21 +3866,19 @@ func (t *ThingsMCP) handleEditTask(_ context.Context, req mcp.CallToolRequest) (
 	}
 	if v := req.GetString("area_uuid", ""); v != "" {
 		u.Area(v)
-		if sched == "" {
-			u.Schedule(1, nil, nil)
-		}
 	}
 	if v := req.GetString("project_uuid", ""); v != "" {
 		u.Project(v)
-		if sched == "" {
-			u.Schedule(1, nil, nil)
-		}
 	}
 	if v := req.GetString("heading_uuid", ""); v != "" {
 		u.Heading(v)
-		if sched == "" {
-			u.Schedule(1, nil, nil)
-		}
+	}
+	// Filing an Inbox task promotes it to Anytime, matching Things' container
+	// semantics. Already-filed tasks keep every scheduling field unless the
+	// caller explicitly supplies schedule.
+	containerChanged := editOpts["area_uuid"] != "" || editOpts["project_uuid"] != "" || editOpts["heading_uuid"] != ""
+	if sched == "" && containerChanged && editTarget != nil && editTarget.Schedule == thingscloud.TaskScheduleInbox {
+		u.Schedule(1, nil, nil)
 	}
 	if _, ok := args["tags"]; ok {
 		u.Tags(splitUUIDs(req.GetString("tags", "")))

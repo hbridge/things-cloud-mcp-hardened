@@ -1037,6 +1037,173 @@ func TestHandleEditTask(t *testing.T) {
 	})
 }
 
+func TestHandleEditTaskContainerMovesPreserveSchedule(t *testing.T) {
+	today := time.Unix(todayMidnightUTC(), 0).UTC()
+	future := today.AddDate(0, 0, 5)
+
+	type scheduleCase struct {
+		name string
+		opts []taskOption
+	}
+	schedules := []scheduleCase{
+		{name: "today", opts: []taskOption{withSchedule(thingscloud.TaskScheduleAnytime), withScheduledDate(today), withTodayIndexRefDate(today)}},
+		{name: "tonight", opts: []taskOption{withSchedule(thingscloud.TaskScheduleAnytime), withScheduledDate(today), withTodayIndexRefDate(today), withStartBucket(1)}},
+		{name: "upcoming", opts: []taskOption{withSchedule(thingscloud.TaskScheduleSomeday), withScheduledDate(future), withTodayIndexRefDate(future)}},
+		{name: "someday", opts: []taskOption{withSchedule(thingscloud.TaskScheduleSomeday)}},
+		{name: "anytime", opts: []taskOption{withSchedule(thingscloud.TaskScheduleAnytime)}},
+		{name: "recurring instance", opts: []taskOption{withSchedule(thingscloud.TaskScheduleSomeday), withScheduledDate(future), withTodayIndexRefDate(today), withStartBucket(1), withRecurrenceTask("template-1")}},
+	}
+	destinations := []struct {
+		name string
+		args map[string]any
+	}{
+		{name: "area", args: map[string]any{"area_uuid": "area-1"}},
+		{name: "project", args: map[string]any{"project_uuid": "project-1"}},
+		{name: "heading", args: map[string]any{"heading_uuid": "heading-1"}},
+	}
+
+	for _, destination := range destinations {
+		for _, schedule := range schedules {
+			t.Run(destination.name+"/"+schedule.name, func(t *testing.T) {
+				taskOpts := append([]taskOption{withTitle("Move without rescheduling")}, schedule.opts...)
+				fc := newFakeCloud("test@example.com",
+					makeAreaItem("area-1", "Work"),
+					makeTaskItem("project-1", withTitle("Project"), withTaskType(thingscloud.TaskTypeProject)),
+					makeTaskItem("heading-1", withTitle("Section"), withTaskType(thingscloud.TaskTypeHeading), withParent("project-1")),
+					makeTaskItem("task-move", taskOpts...),
+				)
+				defer fc.Close()
+				tmcp := newTestThingsMCP(t, fc)
+				before := tmcp.findTask("task-move")
+				beforeSchedule := before.Schedule
+				beforeScheduledDate := before.ScheduledDate
+				beforeTodayRef := before.TodayIndexRefDate
+				beforeStartBucket := before.StartBucket
+
+				args := map[string]any{"uuid": "task-move"}
+				for key, value := range destination.args {
+					args[key] = value
+				}
+				result, err := tmcp.handleEditTask(context.Background(), makeReq(args))
+				if err != nil {
+					t.Fatalf("edit task: %v", err)
+				}
+				assertNotError(t, result)
+
+				payload := committedTaskPayload(t, fc, "task-move")
+				for _, key := range []string{"st", "sr", "tir", "sb"} {
+					if _, ok := payload[key]; ok {
+						t.Errorf("container-only edit unexpectedly wrote %s: %#v", key, payload)
+					}
+				}
+
+				after := tmcp.findTask("task-move")
+				if after.Schedule != beforeSchedule || after.StartBucket != beforeStartBucket || !sameOptionalTime(after.ScheduledDate, beforeScheduledDate) || !sameOptionalTime(after.TodayIndexRefDate, beforeTodayRef) {
+					t.Fatalf("schedule changed: before=%#v after=%#v", before, after)
+				}
+			})
+		}
+	}
+}
+
+func TestHandleEditTaskContainerMoveScheduleRules(t *testing.T) {
+	t.Run("explicit schedule still overrides during move", func(t *testing.T) {
+		today := time.Unix(todayMidnightUTC(), 0).UTC()
+		fc := newFakeCloud("test@example.com",
+			makeAreaItem("area-1", "Work"),
+			makeTaskItem("task-move", withTitle("Move and reschedule"), withScheduledDate(today), withTodayIndexRefDate(today), withStartBucket(1)),
+		)
+		defer fc.Close()
+		tmcp := newTestThingsMCP(t, fc)
+
+		result, err := tmcp.handleEditTask(context.Background(), makeReq(map[string]any{
+			"uuid": "task-move", "area_uuid": "area-1", "schedule": "someday",
+		}))
+		if err != nil {
+			t.Fatalf("edit task: %v", err)
+		}
+		assertNotError(t, result)
+		payload := committedTaskPayload(t, fc, "task-move")
+		if payload["st"] != float64(thingscloud.TaskScheduleSomeday) || payload["sr"] != nil || payload["tir"] != nil || payload["sb"] != float64(0) {
+			t.Fatalf("explicit schedule payload = %#v", payload)
+		}
+	})
+
+	t.Run("filing Inbox task promotes it to Anytime", func(t *testing.T) {
+		fc := newFakeCloud("test@example.com",
+			makeTaskItem("project-1", withTitle("Project"), withTaskType(thingscloud.TaskTypeProject)),
+			makeTaskItem("task-move", withTitle("Inbox task"), withSchedule(thingscloud.TaskScheduleInbox)),
+		)
+		defer fc.Close()
+		tmcp := newTestThingsMCP(t, fc)
+
+		result, err := tmcp.handleEditTask(context.Background(), makeReq(map[string]any{
+			"uuid": "task-move", "project_uuid": "project-1",
+		}))
+		if err != nil {
+			t.Fatalf("edit task: %v", err)
+		}
+		assertNotError(t, result)
+		payload := committedTaskPayload(t, fc, "task-move")
+		if payload["st"] != float64(thingscloud.TaskScheduleAnytime) || payload["sr"] != nil || payload["tir"] != nil {
+			t.Fatalf("Inbox filing payload = %#v", payload)
+		}
+		if task := tmcp.findTask("task-move"); task.Schedule != thingscloud.TaskScheduleAnytime {
+			t.Fatalf("filed Inbox task schedule = %d", task.Schedule)
+		}
+	})
+
+	t.Run("inactive destination is rejected before commit", func(t *testing.T) {
+		fc := newFakeCloud("test@example.com",
+			makeTaskItem("project-1", withTitle("Completed"), withTaskType(thingscloud.TaskTypeProject), withStatus(thingscloud.TaskStatusCompleted)),
+			makeTaskItem("task-move", withTitle("Do not move")),
+		)
+		defer fc.Close()
+		tmcp := newTestThingsMCP(t, fc)
+
+		result, err := tmcp.handleEditTask(context.Background(), makeReq(map[string]any{
+			"uuid": "task-move", "project_uuid": "project-1",
+		}))
+		if err != nil {
+			t.Fatalf("edit task: %v", err)
+		}
+		assertIsError(t, result)
+		if commits := fc.getCommitLog(); len(commits) != 0 {
+			t.Fatalf("rejected move wrote %d commits", len(commits))
+		}
+	})
+}
+
+func committedTaskPayload(t *testing.T, fc *fakeCloud, uuid string) map[string]any {
+	t.Helper()
+	commits := fc.getCommitLog()
+	if len(commits) == 0 {
+		t.Fatal("expected a commit")
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(commits[len(commits)-1], &body); err != nil {
+		t.Fatalf("decode commit: %v", err)
+	}
+	raw, ok := body[uuid]
+	if !ok {
+		t.Fatalf("commit missing %s: %s", uuid, commits[len(commits)-1])
+	}
+	var envelope struct {
+		Payload map[string]any `json:"p"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	return envelope.Payload
+}
+
+func sameOptionalTime(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Equal(*b)
+}
+
 // ---------------------------------------------------------------------------
 // handleFindHeadings
 // ---------------------------------------------------------------------------
