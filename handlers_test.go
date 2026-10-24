@@ -395,6 +395,84 @@ func TestHandleListTasks(t *testing.T) {
 	})
 }
 
+func TestUntitledTasksRemainDiscoverable(t *testing.T) {
+	today := todayMidnightUTC()
+	project := makeTaskItem("project-untitled",
+		withTitle("Reference project"),
+		withTaskType(thingscloud.TaskTypeProject),
+	)
+	noteOnly := makeTaskItem("task-note-only",
+		withTitle("   "),
+		withNote("https://example.com/reference"),
+		withParent("project-untitled"),
+		withScheduledDate(time.Unix(today, 0).UTC()),
+	)
+	checklistOnly := makeTaskItem("task-checklist-only",
+		withTitle(""),
+		withScheduledDate(time.Unix(today, 0).UTC()),
+	)
+	checklist := makeChecklistItem("checklist-only-step", "task-checklist-only", "Read the reference")
+
+	fc := newFakeCloud("test@example.com", project, noteOnly, checklistOnly, checklist)
+	defer fc.Close()
+	tmcp := newTestThingsMCP(t, fc)
+
+	assertTaskPresent := func(t *testing.T, args map[string]any, uuid string) {
+		t.Helper()
+		result, err := tmcp.handleFindTasks(context.Background(), makeReq(args))
+		if err != nil {
+			t.Fatalf("find tasks: %v", err)
+		}
+		assertNotError(t, result)
+		for _, task := range resultJSON[[]TaskOutput](t, result) {
+			if task.UUID == uuid {
+				return
+			}
+		}
+		t.Fatalf("task %s missing for arguments %#v", uuid, args)
+	}
+
+	t.Run("default list includes note-only task", func(t *testing.T) {
+		assertTaskPresent(t, map[string]any{}, "task-note-only")
+	})
+	t.Run("today includes deliberately scheduled checklist-only task", func(t *testing.T) {
+		assertTaskPresent(t, map[string]any{"schedule": "today"}, "task-checklist-only")
+	})
+	t.Run("note search reaches untitled task", func(t *testing.T) {
+		assertTaskPresent(t, map[string]any{"contains_text": "example.com"}, "task-note-only")
+	})
+	t.Run("project children include untitled task", func(t *testing.T) {
+		result, err := tmcp.handleShowProject(context.Background(), makeReq(map[string]any{"uuid": "project-untitled"}))
+		if err != nil {
+			t.Fatalf("show project: %v", err)
+		}
+		assertNotError(t, result)
+		detail := resultJSON[struct {
+			UnfiledTasks []TaskOutput `json:"unfiledTasks"`
+		}](t, result)
+		if len(detail.UnfiledTasks) != 1 || detail.UnfiledTasks[0].UUID != "task-note-only" {
+			t.Fatalf("untitled project child missing: %#v", detail.UnfiledTasks)
+		}
+	})
+	t.Run("overview includes untitled today tasks", func(t *testing.T) {
+		result, err := tmcp.handleOverview(context.Background(), makeReq(map[string]any{}))
+		if err != nil {
+			t.Fatalf("overview: %v", err)
+		}
+		assertNotError(t, result)
+		overview := resultJSON[struct {
+			TodayTasks []TaskOutput `json:"todayTasks"`
+		}](t, result)
+		found := map[string]bool{}
+		for _, task := range overview.TodayTasks {
+			found[task.UUID] = true
+		}
+		if !found["task-note-only"] || !found["task-checklist-only"] {
+			t.Fatalf("overview omitted untitled tasks: %#v", found)
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // handleShowTask
 // ---------------------------------------------------------------------------

@@ -1555,13 +1555,6 @@ func isRecurringTemplate(task *thingscloud.Task) bool {
 	return task.Repeater != nil
 }
 
-// isUntitledTask returns true if the task has no real title. Things sometimes
-// retains shells of tasks created and abandoned without ever being typed into;
-// these are not actionable items and should be hidden from list queries.
-func isUntitledTask(task *thingscloud.Task) bool {
-	return strings.TrimSpace(task.Title) == ""
-}
-
 // ---------------------------------------------------------------------------
 // UUID validation
 // ---------------------------------------------------------------------------
@@ -2728,9 +2721,6 @@ func (t *ThingsMCP) handleFindTasks(_ context.Context, req mcp.CallToolRequest) 
 		if isRecurringTemplate(task) {
 			continue
 		}
-		if isUntitledTask(task) {
-			continue
-		}
 		// Default: exclude trashed and completed
 		if !inTrash && task.InTrash {
 			continue
@@ -3015,9 +3005,6 @@ func (t *ThingsMCP) handleShowProject(_ context.Context, req mcp.CallToolRequest
 		if isRecurringTemplate(task) {
 			continue
 		}
-		if isUntitledTask(task) {
-			continue
-		}
 		switch statusFilter {
 		case "completed":
 			if task.Status != 3 {
@@ -3155,9 +3142,6 @@ func (t *ThingsMCP) handleFindProjects(_ context.Context, req mcp.CallToolReques
 			continue
 		}
 		if isRecurringTemplate(task) {
-			continue
-		}
-		if isUntitledTask(task) {
 			continue
 		}
 		if !inTrash && task.InTrash {
@@ -3415,9 +3399,6 @@ func (t *ThingsMCP) handleOverview(_ context.Context, req mcp.CallToolRequest) (
 		if isRecurringTemplate(task) {
 			continue
 		}
-		if isUntitledTask(task) {
-			continue
-		}
 		if !t.taskIsEffectivelyActive(task) {
 			continue
 		}
@@ -3439,9 +3420,6 @@ func (t *ThingsMCP) handleOverview(_ context.Context, req mcp.CallToolRequest) (
 			continue
 		}
 		if isRecurringTemplate(task) {
-			continue
-		}
-		if isUntitledTask(task) {
 			continue
 		}
 		if !t.taskIsEffectivelyActive(task) {
